@@ -832,6 +832,198 @@ def cron_run(
 
 
 @app.command()
+def doctor(
+    watch: bool = typer.Option(False, "--watch", "-w", help="Watch mode: auto-reload on file changes"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show detailed diagnostic info"),
+):
+    """Check health & optionally run gateway with hot-reload.
+
+    Without --watch: run diagnostics and exit.
+    With --watch: start gateway, watch for .py file changes, auto-restart.
+    """
+    import importlib
+    import time as _time
+
+    from nanobot.config.loader import load_config, get_config_path
+
+    # ── Phase 1: Health checks ────────────────────────────────────
+    console.print(f"{__logo__} [bold]nanobot doctor[/bold]\n")
+
+    config_path = get_config_path()
+    all_ok = True
+
+    # Config file
+    if config_path.exists():
+        console.print(f"  [green]✓[/green] Config: {config_path}")
+    else:
+        console.print(f"  [red]✗[/red] Config: {config_path} [red]missing[/red]")
+        all_ok = False
+
+    config = load_config()
+    workspace = config.workspace_path
+
+    # Workspace
+    if workspace.exists():
+        console.print(f"  [green]✓[/green] Workspace: {workspace}")
+    else:
+        console.print(f"  [red]✗[/red] Workspace: {workspace} [red]missing[/red]")
+        all_ok = False
+
+    # SOUL.md
+    soul = workspace / "SOUL.md"
+    if soul.exists():
+        console.print(f"  [green]✓[/green] SOUL.md")
+    else:
+        console.print(f"  [yellow]![/yellow] SOUL.md not found (will use default persona)")
+
+    # Model
+    console.print(f"  [green]✓[/green] Model: {config.agents.defaults.model}")
+
+    # Provider API keys
+    from nanobot.providers.registry import PROVIDERS
+    for spec in PROVIDERS:
+        p = getattr(config.providers, spec.name, None)
+        if p is None:
+            continue
+        if spec.is_local:
+            if p.api_base:
+                console.print(f"  [green]✓[/green] {spec.label}: {p.api_base}")
+            elif verbose:
+                console.print(f"  [dim]  {spec.label}: not set[/dim]")
+        else:
+            if p.api_key:
+                console.print(f"  [green]✓[/green] {spec.label}: ****{p.api_key[-4:]}")
+            elif verbose:
+                console.print(f"  [dim]  {spec.label}: not set[/dim]")
+
+    # Channels
+    enabled = []
+    for ch_name in ["telegram", "whatsapp", "discord", "feishu", "slack", "mochat", "dingtalk"]:
+        ch_cfg = getattr(config.channels, ch_name, None)
+        if ch_cfg and getattr(ch_cfg, "enabled", False):
+            enabled.append(ch_name)
+    if enabled:
+        console.print(f"  [green]✓[/green] Channels: {', '.join(enabled)}")
+    else:
+        console.print(f"  [yellow]![/yellow] No channels enabled")
+
+    # Import check
+    try:
+        importlib.import_module("nanobot.agent.loop")
+        importlib.import_module("nanobot.agent.prompts")
+        console.print(f"  [green]✓[/green] Imports OK")
+    except Exception as e:
+        console.print(f"  [red]✗[/red] Import error: {e}")
+        all_ok = False
+
+    if not all_ok:
+        console.print("\n[red]Some checks failed. Fix the issues above before running.[/red]")
+        if not watch:
+            raise typer.Exit(1)
+
+    console.print()
+
+    # ── Phase 2: Run gateway (only with --watch) ──────────────────
+    if not watch:
+        console.print("[green]All checks passed.[/green]")
+        return
+
+    console.print("[bold]Starting gateway with hot-reload...[/bold]\n")
+
+    src_dir = Path(__file__).parent.parent  # nanobot/ package root
+
+    def _snapshot() -> dict[str, float]:
+        """Get mtime snapshot of all .py files."""
+        snap = {}
+        for py in src_dir.rglob("*.py"):
+            try:
+                snap[str(py)] = py.stat().st_mtime
+            except OSError:
+                pass
+        return snap
+
+    crash_times: list[float] = []
+    MAX_CRASHES = 5
+    CRASH_WINDOW = 60  # seconds
+
+    while True:
+        last_snap = _snapshot()
+        console.print(f"[dim]{_time.strftime('%H:%M:%S')}[/dim] [green]▶[/green] Gateway starting...")
+
+        proc = None
+        try:
+            proc = asyncio.subprocess.PIPE  # placeholder for type
+            # Run gateway as a subprocess so we can kill & restart it
+            proc = _run_gateway_subprocess()
+
+            # Poll for file changes while gateway runs
+            while proc.poll() is None:
+                _time.sleep(1.5)
+                new_snap = _snapshot()
+                changed = [
+                    f for f in set(list(last_snap.keys()) + list(new_snap.keys()))
+                    if last_snap.get(f) != new_snap.get(f)
+                ]
+                if changed:
+                    short = [Path(f).name for f in changed[:5]]
+                    console.print(
+                        f"[dim]{_time.strftime('%H:%M:%S')}[/dim] "
+                        f"[yellow]↻[/yellow] Changed: {', '.join(short)} — reloading..."
+                    )
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        proc.kill()
+                    break
+                last_snap = new_snap
+
+            exit_code = proc.returncode if proc and hasattr(proc, 'returncode') else None
+
+            if exit_code is not None and exit_code != 0:
+                now = _time.monotonic()
+                crash_times.append(now)
+                # Keep only recent crashes
+                crash_times[:] = [t for t in crash_times if now - t < CRASH_WINDOW]
+
+                if len(crash_times) >= MAX_CRASHES:
+                    console.print(
+                        f"[red]✗ {MAX_CRASHES} crashes in {CRASH_WINDOW}s — "
+                        f"crash loop detected. Waiting for file change...[/red]"
+                    )
+                    # Wait for a file change before retrying
+                    while True:
+                        _time.sleep(1.5)
+                        new_snap = _snapshot()
+                        if any(last_snap.get(f) != new_snap.get(f)
+                               for f in set(list(last_snap.keys()) + list(new_snap.keys()))):
+                            crash_times.clear()
+                            break
+                        last_snap = new_snap
+                else:
+                    console.print(
+                        f"[dim]{_time.strftime('%H:%M:%S')}[/dim] "
+                        f"[red]✗[/red] Exit code {exit_code} — restarting in 2s..."
+                    )
+                    _time.sleep(2)
+        except KeyboardInterrupt:
+            console.print("\n[dim]Shutting down...[/dim]")
+            if proc and hasattr(proc, 'terminate'):
+                proc.terminate()
+            break
+
+
+def _run_gateway_subprocess():
+    """Start `nanobot gateway` as a subprocess and return the Popen handle."""
+    import subprocess
+    return subprocess.Popen(
+        [sys.executable, "-m", "nanobot", "gateway"],
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+    )
+
+
+@app.command()
 def status():
     """Show nanobot status."""
     from nanobot.config.loader import load_config, get_config_path
