@@ -2,10 +2,12 @@
 
 import json
 import os
+import re
 from typing import Any
 
 import litellm
 from litellm import acompletion
+from loguru import logger
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.providers.registry import find_by_model, find_gateway
@@ -193,9 +195,30 @@ class LiteLLMProvider(LLMProvider):
             }
         
         reasoning_content = getattr(message, "reasoning_content", None)
-        
+        content = message.content
+
+        # Debug: log raw fields for thinking-model diagnostics
+        if reasoning_content or (content and "<think>" in content):
+            logger.debug(
+                f"Thinking model raw: content={content[:120] if content else None!r}, "
+                f"reasoning_content={reasoning_content[:80] if reasoning_content else None!r}"
+            )
+
+        # ── Thinking-model sanitisation ──────────────────────────────
+        # Models like Qwen 3/3.5 (DashScope) may embed a <think>…</think>
+        # block inside `content` instead of (or in addition to) the
+        # separate `reasoning_content` field.  Strip it so only the real
+        # answer reaches the user.
+        if content and "<think>" in content:
+            think_match = re.search(r"<think>([\s\S]*?)</think>", content)
+            if think_match:
+                if not reasoning_content:
+                    reasoning_content = think_match.group(1).strip()
+                content = content[:think_match.start()] + content[think_match.end():]
+                content = content.strip() or None
+
         return LLMResponse(
-            content=message.content,
+            content=content,
             tool_calls=tool_calls,
             finish_reason=choice.finish_reason or "stop",
             usage=usage,
