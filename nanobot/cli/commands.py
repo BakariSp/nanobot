@@ -1002,6 +1002,17 @@ def doctor(
     crash_times: list[float] = []
     _reload_requested = False
     _stable_recorded = False
+    _doctor_proc = None  # reference for signal handler
+
+    def _doctor_sigint(signum, frame):
+        """Ctrl+C handler: kill subprocess immediately and exit."""
+        console.print("\n[dim]Shutting down...[/dim]")
+        if _doctor_proc and _doctor_proc.poll() is None:
+            _doctor_proc.kill()
+            _doctor_proc.wait(timeout=5)
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGINT, _doctor_sigint)
 
     while True:
         _reload_requested = False
@@ -1019,6 +1030,7 @@ def doctor(
             # Start gateway subprocess with stderr captured to file
             stderr_fh = open(stderr_log, "w", encoding="utf-8")
             proc = _run_gateway_subprocess(stderr_fh)
+            _doctor_proc = proc
 
             # Poll for file changes while gateway runs
             while proc.poll() is None:
@@ -1197,14 +1209,51 @@ def doctor(
 
 
 def _run_gateway_subprocess(stderr_fh=None):
-    """Start `nanobot gateway` as a subprocess and return the Popen handle."""
-    import subprocess
+    """Start `nanobot gateway` as a subprocess and return the Popen handle.
 
-    return subprocess.Popen(
+    stderr is piped through a background thread that tees every line to both
+    the terminal (sys.stderr) and the log file (stderr_fh), so the user sees
+    gateway output in real-time while crash logs are still captured to disk.
+    """
+    import subprocess
+    import threading
+
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+
+    proc = subprocess.Popen(
         [sys.executable, "-m", "nanobot", "gateway"],
         stdout=sys.stdout,
-        stderr=stderr_fh or sys.stderr,
+        stderr=subprocess.PIPE,
+        env=env,
     )
+
+    # Use raw bytes for terminal output to avoid Windows encoding issues
+    stderr_raw = getattr(sys.stderr, "buffer", sys.stderr)
+
+    def _tee_stderr():
+        """Read stderr line by line, write to both terminal and log file."""
+        try:
+            for raw_line in iter(proc.stderr.readline, b""):
+                # Write raw bytes to terminal (preserves UTF-8)
+                try:
+                    stderr_raw.write(raw_line)
+                    stderr_raw.flush()
+                except (TypeError, AttributeError):
+                    sys.stderr.write(raw_line.decode("utf-8", errors="replace"))
+                    sys.stderr.flush()
+                # Write decoded text to log file
+                if stderr_fh:
+                    stderr_fh.write(raw_line.decode("utf-8", errors="replace"))
+                    stderr_fh.flush()
+        except (ValueError, OSError):
+            pass  # pipe closed
+
+    t = threading.Thread(target=_tee_stderr, daemon=True)
+    t.start()
+    proc._tee_thread = t  # keep reference to prevent GC
+
+    return proc
 
 
 @app.command()
