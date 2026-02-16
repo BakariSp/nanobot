@@ -5,7 +5,7 @@ import json
 import random
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +15,7 @@ from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
 from nanobot.agent.context import ContextBuilder
-from nanobot.agent.prompts import followup_nudge_context, zero_system_prompt, jarvis_system_prompt
+from nanobot.agent.prompts import followup_nudge_context, startup_greeting_context, zero_system_prompt, jarvis_system_prompt
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
 from nanobot.agent.tools.shell import ExecTool
@@ -26,6 +26,50 @@ from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import Session, SessionManager
+
+
+# ── Conversation archive (append-only, for future model training) ──
+
+_CONVO_LOG_DIR = Path.home() / ".nanobot" / "logs" / "conversations"
+
+
+def _archive_message(
+    direction: str,
+    channel: str,
+    chat_id: str,
+    content: str,
+    *,
+    sender_id: str = "",
+    tools_used: list[str] | None = None,
+    metadata: dict | None = None,
+) -> None:
+    """Append a single message to the daily conversation JSONL file.
+
+    File: ~/.nanobot/logs/conversations/YYYY-MM-DD.jsonl
+    Each line is a self-contained JSON object, easy to grep / load for training.
+    """
+    _CONVO_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc)
+    entry = {
+        "ts": now.isoformat(),
+        "ts_local": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "direction": direction,  # "in" | "out" | "system"
+        "channel": channel,
+        "chat_id": chat_id,
+        "sender_id": sender_id,
+        "content": content,
+    }
+    if tools_used:
+        entry["tools_used"] = tools_used
+    if metadata:
+        entry["metadata"] = metadata
+
+    path = _CONVO_LOG_DIR / f"{now.strftime('%Y-%m-%d')}.jsonl"
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError as e:
+        logger.warning(f"Conversation archive write failed: {e}")
 
 
 # ── Secretary command parsing ────────────────────────────────────
@@ -368,6 +412,9 @@ class AgentLoop:
 
         logger.info("Agent loop started")
 
+        # ── Restore active chats from session history & send startup greeting ──
+        await self._startup_greet()
+
         while self._running:
             try:
                 msg = await asyncio.wait_for(
@@ -402,6 +449,87 @@ class AgentLoop:
         self._running = False
         logger.info("Agent loop stopping")
 
+    # ── Startup greeting ───────────────────────────────────────
+
+    async def _startup_greet(self) -> None:
+        """Restore active chats from persisted sessions and send a startup greeting.
+
+        Scans all saved sessions to find channel chats (not CLI), restores them
+        into _active_chats, then asks the LLM to generate a natural greeting
+        for each. The LLM decides whether the current time is appropriate —
+        no hardcoded time windows.
+        """
+        now_mono = time.monotonic()
+        restored = []
+
+        for info in self.sessions.list_sessions():
+            key = info.get("key", "")
+            # Session keys are "channel:chat_id" — skip CLI sessions
+            if not key or key.startswith("cli:") or key.startswith("cron:") or key.startswith("heartbeat"):
+                continue
+            parts = key.split(":", 1)
+            if len(parts) != 2:
+                continue
+            channel, chat_id = parts
+            chat_key = (channel, chat_id)
+            self._active_chats.add(chat_key)
+            self._last_user_msg_at[chat_key] = now_mono
+            self._next_followup_at[chat_key] = now_mono + random.uniform(120, 600)
+            restored.append((channel, chat_id, key))
+
+        if not restored:
+            logger.info("Startup greet: no previous chats to greet")
+            return
+
+        logger.info(f"Startup greet: restored {len(restored)} active chat(s), sending greetings...")
+
+        for channel, chat_id, session_key in restored:
+            session = self.sessions.get_or_create(session_key)
+            if not session.messages:
+                continue
+
+            memory_context = self.context.memory.get_memory_context()
+            system_prompt = zero_system_prompt(str(self.workspace), memory_context)
+            max_history = min(self.memory_window, 20)
+            history = session.get_history(max_messages=max_history)
+
+            last_ts = session.messages[-1].get("timestamp", "") if session.messages else ""
+            nudge = startup_greeting_context(last_message_ts=last_ts)
+            messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+            messages.extend(history)
+            messages.append({"role": "user", "content": nudge})
+
+            try:
+                response = await self.provider.chat(
+                    messages=messages,
+                    tools=[],
+                    model=self.model,
+                    temperature=0.9,
+                    max_tokens=256,
+                )
+                reply = (response.content or "").strip()
+            except Exception as e:
+                logger.warning(f"Startup greeting failed for {session_key}: {e}")
+                continue
+
+            if not reply or "[SKIP]" in reply:
+                logger.debug(f"Startup greeting skipped for {session_key} (LLM decided)")
+                continue
+
+            logger.info(f"Startup greeting to {session_key}: {reply[:80]}")
+            session.add_message("assistant", reply)
+            self.sessions.save(session)
+            _archive_message("out", channel, chat_id, reply,
+                             metadata={"trigger": "startup_greeting"})
+
+            parts = [p.strip() for p in re.split(r"\n---\n", reply) if p.strip()]
+            for i, part in enumerate(parts):
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=channel, chat_id=chat_id, content=part,
+                ))
+                if i < len(parts) - 1:
+                    await asyncio.sleep(0.8)
+
     # ── Proactive conversation follow-up ─────────────────────────
 
     async def _maybe_conversation_followup(self) -> None:
@@ -411,17 +539,15 @@ class AgentLoop:
         something worth saying — producing natural, personality-consistent
         follow-ups rather than hardcoded nudges.
 
+        No hardcoded time restriction — the LLM decides based on MEMORY.md
+        whether the current time is appropriate to reach out.
+
         Timing (all randomised per-chat):
           - After a user message:  first consideration in 2-10 min
           - After Zero follows up: cooldown 20-45 min
           - After LLM says [SKIP]: cooldown 10-30 min
         """
         now = time.monotonic()
-
-        # Only during reasonable hours (9 AM - 10 PM)
-        hour = datetime.now().hour
-        if not (9 <= hour <= 22):
-            return
 
         for chat_key in list(self._active_chats):
             next_at = self._next_followup_at.get(chat_key)
@@ -487,6 +613,8 @@ class AgentLoop:
             logger.info(f"Follow-up to {session_key} (silent {silent_minutes}m): {reply[:80]}")
             session.add_message("assistant", reply)
             self.sessions.save(session)
+            _archive_message("out", channel, chat_id, reply,
+                             metadata={"trigger": "followup", "silent_minutes": silent_minutes})
 
             # Split on --- like normal messages (multi-bubble)
             parts = [p.strip() for p in re.split(r"\n---\n", reply) if p.strip()]
@@ -519,6 +647,10 @@ class AgentLoop:
 
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info(f"Processing message from {msg.channel}:{msg.sender_id}: {preview}")
+
+        # Archive inbound message
+        _archive_message("in", msg.channel, msg.chat_id, msg.content,
+                         sender_id=msg.sender_id)
 
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
@@ -614,13 +746,27 @@ class AgentLoop:
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
 
+        # [SILENT] — Zero chose not to reply (e.g. user hasn't finished typing).
+        # Record in session history so she has context, but send nothing.
+        is_silent = "[SILENT]" in final_content
+
+        session.add_message("user", msg.content)
+        if not is_silent:
+            session.add_message("assistant", final_content,
+                                tools_used=tools_used if tools_used else None)
+        self.sessions.save(session)
+
+        if is_silent:
+            logger.info(f"[SILENT] for {msg.channel}:{msg.sender_id} — no outbound")
+            _archive_message("out", msg.channel, msg.chat_id, "[SILENT]")
+            return None
+
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info(f"Response to {msg.channel}:{msg.sender_id}: {preview}")
 
-        session.add_message("user", msg.content)
-        session.add_message("assistant", final_content,
-                            tools_used=tools_used if tools_used else None)
-        self.sessions.save(session)
+        # Archive outbound response
+        _archive_message("out", msg.channel, msg.chat_id, final_content,
+                         tools_used=tools_used if tools_used else None)
 
         return OutboundMessage(
             channel=msg.channel,
