@@ -14,6 +14,7 @@ import makeWASocket, {
 import { Boom } from '@hapi/boom';
 import qrcode from 'qrcode-terminal';
 import pino from 'pino';
+import { HttpsProxyAgent } from 'https-proxy-agent';
 
 const VERSION = '0.1.0';
 
@@ -24,6 +25,8 @@ export interface InboundMessage {
   content: string;
   timestamp: number;
   isGroup: boolean;
+  /** Text of the quoted/replied-to message, if any */
+  quotedText?: string;
 }
 
 export interface WhatsAppClientOptions {
@@ -37,6 +40,9 @@ export class WhatsAppClient {
   private sock: any = null;
   private options: WhatsAppClientOptions;
   private reconnecting = false;
+  private _sentIds: Set<string> = new Set();
+  /** Cache recent inbound messages so we can quote them in replies */
+  private _recentMessages: Map<string, any> = new Map();
 
   constructor(options: WhatsAppClientOptions) {
     this.options = options;
@@ -48,6 +54,29 @@ export class WhatsAppClient {
     const { version } = await fetchLatestBaileysVersion();
 
     console.log(`Using Baileys version: ${version.join('.')}`);
+
+    // Proxy support: use HTTPS_PROXY, HTTP_PROXY, or default to Clash mixed port
+    const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.ALL_PROXY;
+    let agent: any = undefined;
+    if (proxyUrl) {
+      agent = new HttpsProxyAgent(proxyUrl);
+      console.log(`🔀 Using proxy: ${proxyUrl}`);
+    } else {
+      // Auto-detect: try Clash default mixed port
+      const defaultProxy = 'http://127.0.0.1:7890';
+      try {
+        const net = await import('net');
+        await new Promise<void>((resolve, reject) => {
+          const s = net.createConnection({ host: '127.0.0.1', port: 7890 }, () => { s.end(); resolve(); });
+          s.on('error', reject);
+          s.setTimeout(1000, () => { s.destroy(); reject(new Error('timeout')); });
+        });
+        agent = new HttpsProxyAgent(defaultProxy);
+        console.log(`🔀 Auto-detected proxy: ${defaultProxy}`);
+      } catch {
+        console.log('ℹ️  No proxy detected, connecting directly');
+      }
+    }
 
     // Create socket following OpenClaw's pattern
     this.sock = makeWASocket({
@@ -61,6 +90,7 @@ export class WhatsAppClient {
       browser: ['nanobot', 'cli', VERSION],
       syncFullHistory: false,
       markOnlineOnConnect: false,
+      agent,
     });
 
     // Handle WebSocket errors
@@ -110,14 +140,25 @@ export class WhatsAppClient {
       if (type !== 'notify') return;
 
       for (const msg of messages) {
-        // Skip own messages
-        if (msg.key.fromMe) continue;
-
         // Skip status updates
         if (msg.key.remoteJid === 'status@broadcast') continue;
 
-        const content = this.extractMessageContent(msg);
-        if (!content) continue;
+        // Track messages sent by the bridge to avoid echo loops
+        if (msg.key.fromMe && this._sentIds.has(msg.key.id || '')) {
+          this._sentIds.delete(msg.key.id || '');
+          continue;
+        }
+
+        const extracted = this.extractMessageContent(msg);
+        if (!extracted) continue;
+
+        // Store the raw message for potential quoting later
+        this._recentMessages.set(msg.key.id || '', msg);
+        // Evict old entries (keep last 200)
+        if (this._recentMessages.size > 200) {
+          const oldest = this._recentMessages.keys().next().value;
+          if (oldest !== undefined) this._recentMessages.delete(oldest);
+        }
 
         const isGroup = msg.key.remoteJid?.endsWith('@g.us') || false;
 
@@ -125,57 +166,92 @@ export class WhatsAppClient {
           id: msg.key.id || '',
           sender: msg.key.remoteJid || '',
           pn: msg.key.remoteJidAlt || '',
-          content,
+          content: extracted.text,
           timestamp: msg.messageTimestamp as number,
           isGroup,
+          quotedText: extracted.quotedText,
         });
       }
     });
   }
 
-  private extractMessageContent(msg: any): string | null {
+  private extractMessageContent(msg: any): { text: string; quotedText?: string } | null {
     const message = msg.message;
     if (!message) return null;
 
-    // Text message
-    if (message.conversation) {
-      return message.conversation;
+    let text: string | null = null;
+    let quotedText: string | undefined;
+
+    // Extended text (reply, link preview) — check first, it has contextInfo
+    if (message.extendedTextMessage) {
+      text = message.extendedTextMessage.text || null;
+      // Extract the quoted message text if the user is replying to a previous message
+      const ctx = message.extendedTextMessage.contextInfo;
+      if (ctx?.quotedMessage) {
+        const qm = ctx.quotedMessage;
+        quotedText =
+          qm.conversation ||
+          qm.extendedTextMessage?.text ||
+          qm.imageMessage?.caption ||
+          qm.videoMessage?.caption ||
+          qm.documentMessage?.caption ||
+          undefined;
+      }
     }
 
-    // Extended text (reply, link preview)
-    if (message.extendedTextMessage?.text) {
-      return message.extendedTextMessage.text;
+    // Text message
+    if (!text && message.conversation) {
+      text = message.conversation;
     }
 
     // Image with caption
-    if (message.imageMessage?.caption) {
-      return `[Image] ${message.imageMessage.caption}`;
+    if (!text && message.imageMessage?.caption) {
+      text = `[Image] ${message.imageMessage.caption}`;
     }
 
     // Video with caption
-    if (message.videoMessage?.caption) {
-      return `[Video] ${message.videoMessage.caption}`;
+    if (!text && message.videoMessage?.caption) {
+      text = `[Video] ${message.videoMessage.caption}`;
     }
 
     // Document with caption
-    if (message.documentMessage?.caption) {
-      return `[Document] ${message.documentMessage.caption}`;
+    if (!text && message.documentMessage?.caption) {
+      text = `[Document] ${message.documentMessage.caption}`;
     }
 
     // Voice/Audio message
-    if (message.audioMessage) {
-      return `[Voice Message]`;
+    if (!text && message.audioMessage) {
+      text = `[Voice Message]`;
     }
 
-    return null;
+    if (!text) return null;
+    return { text, quotedText };
   }
 
-  async sendMessage(to: string, text: string): Promise<void> {
+  async sendMessage(to: string, text: string, quoteId?: string): Promise<void> {
     if (!this.sock) {
       throw new Error('Not connected');
     }
 
-    await this.sock.sendMessage(to, { text });
+    // If a quoteId was provided and we have the original message cached, quote it
+    const quoted = quoteId ? this._recentMessages.get(quoteId) : undefined;
+
+    const sent = await this.sock.sendMessage(to, { text }, quoted ? { quoted } : undefined);
+    // Track sent message ID to avoid echo when messaging self
+    if (sent?.key?.id) {
+      this._sentIds.add(sent.key.id);
+      // Auto-cleanup after 60s to prevent memory leak
+      setTimeout(() => this._sentIds.delete(sent.key.id), 60000);
+
+      // Also cache our own sent messages so they can be quoted later
+      if (sent) {
+        this._recentMessages.set(sent.key.id, sent);
+        if (this._recentMessages.size > 200) {
+          const oldest = this._recentMessages.keys().next().value;
+          if (oldest !== undefined) this._recentMessages.delete(oldest);
+        }
+      }
+    }
   }
 
   async disconnect(): Promise<void> {

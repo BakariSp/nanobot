@@ -21,3 +21,6 @@ This file stores important information that should persist across sessions.
 ---
 
 *This file is automatically updated by nanobot when important information should be remembered.*
+
+## Active Task
+- task: none

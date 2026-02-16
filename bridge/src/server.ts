@@ -10,6 +10,8 @@ interface SendCommand {
   type: 'send';
   to: string;
   text: string;
+  /** Message ID to quote/reply to (optional) */
+  quoteId?: string;
 }
 
 interface BridgeMessage {
@@ -94,7 +96,7 @@ export class BridgeServer {
 
   private async handleCommand(cmd: SendCommand): Promise<void> {
     if (cmd.type === 'send' && this.wa) {
-      await this.wa.sendMessage(cmd.to, cmd.text);
+      await this.wa.sendMessage(cmd.to, cmd.text, cmd.quoteId);
     }
   }
 
