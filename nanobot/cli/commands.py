@@ -330,7 +330,12 @@ def gateway(
     # Create cron service first (callback set after agent creation)
     cron_store_path = get_data_dir() / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
-    
+
+    # Create task ledgers (secretary architecture)
+    from nanobot.agent.tools.task_ledger import TaskLedger, DualLedger
+    task_ledger = TaskLedger()
+    dual_ledger = DualLedger()
+
     # Create agent with cron service
     agent = AgentLoop(
         bus=bus,
@@ -346,6 +351,8 @@ def gateway(
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
+        task_ledger=task_ledger,
+        dual_ledger=dual_ledger,
     )
     
     # Set cron callback (needs agent)
@@ -393,6 +400,8 @@ def gateway(
     
     console.print(f"[green]✓[/green] Heartbeat: every 30m")
     
+    from nanobot.ralph_loop import ralph_loop as _ralph_loop
+
     async def run():
         try:
             await cron.start()
@@ -400,6 +409,7 @@ def gateway(
             await asyncio.gather(
                 agent.run(),
                 channels.start_all(),
+                _ralph_loop(),
             )
         except KeyboardInterrupt:
             console.print("\nShutting down...")
@@ -440,7 +450,12 @@ def agent(
         logger.enable("nanobot")
     else:
         logger.disable("nanobot")
-    
+
+    # Create task ledgers (secretary architecture)
+    from nanobot.agent.tools.task_ledger import TaskLedger, DualLedger
+    task_ledger = TaskLedger()
+    dual_ledger = DualLedger()
+
     agent_loop = AgentLoop(
         bus=bus,
         provider=provider,
@@ -453,6 +468,8 @@ def agent(
         brave_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
         restrict_to_workspace=config.tools.restrict_to_workspace,
+        task_ledger=task_ledger,
+        dual_ledger=dual_ledger,
     )
     
     # Show spinner when logs are off (no output to miss); skip when logs are on
@@ -833,13 +850,13 @@ def cron_run(
 
 @app.command()
 def doctor(
-    watch: bool = typer.Option(False, "--watch", "-w", help="Watch mode: auto-reload on file changes"),
+    check_only: bool = typer.Option(False, "--check", "-c", help="Run diagnostics only, don't start gateway"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show detailed diagnostic info"),
 ):
-    """Check health & optionally run gateway with hot-reload.
+    """Health check + start gateway with auto-reload.
 
-    Without --watch: run diagnostics and exit.
-    With --watch: start gateway, watch for .py file changes, auto-restart.
+    Default: run diagnostics, then start gateway with file-watch hot-reload.
+    With --check: run diagnostics only and exit.
     """
     import importlib
     import time as _time
@@ -918,19 +935,59 @@ def doctor(
 
     if not all_ok:
         console.print("\n[red]Some checks failed. Fix the issues above before running.[/red]")
-        if not watch:
+        if check_only:
             raise typer.Exit(1)
 
     console.print()
 
-    # ── Phase 2: Run gateway (only with --watch) ──────────────────
-    if not watch:
+    # ── Phase 2: diagnostics-only exit ────────────────────────────
+    if check_only:
         console.print("[green]All checks passed.[/green]")
         return
 
+    # ── Phase 3: Run gateway with hot-reload (single control plane) ─
     console.print("[bold]Starting gateway with hot-reload...[/bold]\n")
 
+    from nanobot.doctor.state import (
+        load_state, save_state, new_run_id,
+        record_crash, record_crash_loop, record_stable_run,
+        should_attempt_rollback, record_rollback, STABLE_THRESHOLD_S,
+    )
+    from nanobot.doctor.notify import (
+        make_event, append_event, send_telegram_alert,
+    )
+    from nanobot.doctor.git_ops import snapshot as git_snapshot, safe_rollback
+
+    # Load doctor config
+    doc_cfg = config.doctor
+    MAX_CRASHES = doc_cfg.max_crashes
+    CRASH_WINDOW = doc_cfg.crash_window_s
+    stable_threshold = doc_cfg.stable_threshold_s
+
+    # Telegram notification targets
+    tg = config.channels.telegram
+    tg_token = tg.token if tg.enabled else ""
+    tg_chat_ids = tg.notify_chat_ids or tg.allow_from
+    tg_proxy = tg.proxy
+
+    # Doctor state
+    state = load_state()
+    run_id = new_run_id()
+    state["current_run_id"] = run_id
+    state["current_run_start"] = _time.monotonic()
+    save_state(state)
+
+    # Optional startup notification
+    if doc_cfg.notify_on_startup and tg_token:
+        evt = make_event("gateway", None, run_id=run_id, event_type="startup")
+        append_event(evt)
+        send_telegram_alert(tg_token, tg_chat_ids, evt, tg_proxy)
+
+    # Detect nanobot package root for .py watching
     src_dir = Path(__file__).parent.parent  # nanobot/ package root
+    # Stderr capture log for crash diagnosis
+    stderr_log = Path.home() / ".nanobot" / "logs" / "gateway_stderr.log"
+    stderr_log.parent.mkdir(parents=True, exist_ok=True)
 
     def _snapshot() -> dict[str, float]:
         """Get mtime snapshot of all .py files."""
@@ -943,25 +1000,35 @@ def doctor(
         return snap
 
     crash_times: list[float] = []
-    MAX_CRASHES = 5
-    CRASH_WINDOW = 60  # seconds
+    _reload_requested = False
+    _stable_recorded = False
 
     while True:
+        _reload_requested = False
+        _stable_recorded = False
+        stable_since = _time.monotonic()
         last_snap = _snapshot()
-        console.print(f"[dim]{_time.strftime('%H:%M:%S')}[/dim] [green]▶[/green] Gateway starting...")
+        console.print(
+            f"[dim]{_time.strftime('%H:%M:%S')}[/dim] "
+            f"[green]▶[/green] Gateway starting..."
+        )
 
         proc = None
+        stderr_fh = None
         try:
-            proc = asyncio.subprocess.PIPE  # placeholder for type
-            # Run gateway as a subprocess so we can kill & restart it
-            proc = _run_gateway_subprocess()
+            # Start gateway subprocess with stderr captured to file
+            stderr_fh = open(stderr_log, "w", encoding="utf-8")
+            proc = _run_gateway_subprocess(stderr_fh)
 
             # Poll for file changes while gateway runs
             while proc.poll() is None:
                 _time.sleep(1.5)
+
+                # Check for file changes → hot-reload
                 new_snap = _snapshot()
                 changed = [
-                    f for f in set(list(last_snap.keys()) + list(new_snap.keys()))
+                    f
+                    for f in set(list(last_snap.keys()) + list(new_snap.keys()))
                     if last_snap.get(f) != new_snap.get(f)
                 ]
                 if changed:
@@ -970,6 +1037,7 @@ def doctor(
                         f"[dim]{_time.strftime('%H:%M:%S')}[/dim] "
                         f"[yellow]↻[/yellow] Changed: {', '.join(short)} — reloading..."
                     )
+                    _reload_requested = True
                     proc.terminate()
                     try:
                         proc.wait(timeout=5)
@@ -978,48 +1046,164 @@ def doctor(
                     break
                 last_snap = new_snap
 
-            exit_code = proc.returncode if proc and hasattr(proc, 'returncode') else None
+                # Check stable timer → record last_good_commit
+                if (
+                    not _stable_recorded
+                    and (_time.monotonic() - stable_since) > stable_threshold
+                ):
+                    try:
+                        gs = git_snapshot(str(src_dir.parent))
+                        record_stable_run(state, gs.commit, gs.branch)
+                        _stable_recorded = True
+                        console.print(
+                            f"[dim]{_time.strftime('%H:%M:%S')}[/dim] "
+                            f"[green]✓[/green] Stable — recorded {gs.commit[:8]} as last_good"
+                        )
+                    except Exception as e:
+                        _stable_recorded = True  # don't retry on error
+                        if verbose:
+                            console.print(f"[dim]  git snapshot skipped: {e}[/dim]")
 
-            if exit_code is not None and exit_code != 0:
-                now = _time.monotonic()
-                crash_times.append(now)
-                # Keep only recent crashes
-                crash_times[:] = [t for t in crash_times if now - t < CRASH_WINDOW]
+            # Close stderr file before reading
+            if stderr_fh:
+                stderr_fh.close()
+                stderr_fh = None
 
-                if len(crash_times) >= MAX_CRASHES:
+            exit_code = proc.returncode if proc and hasattr(proc, "returncode") else None
+
+            # ── Reload path: skip crash counting ──
+            if _reload_requested:
+                console.print(
+                    f"[dim]{_time.strftime('%H:%M:%S')}[/dim] "
+                    f"[green]↻[/green] Reload complete."
+                )
+                continue
+
+            # ── Clean exit ──
+            if exit_code is None or exit_code == 0:
+                continue
+
+            # ── Crash path ──
+            stderr_tail = ""
+            try:
+                stderr_tail = stderr_log.read_text(encoding="utf-8")[-500:]
+            except Exception:
+                pass
+
+            now = _time.monotonic()
+            crash_times.append(now)
+            crash_times[:] = [t for t in crash_times if now - t < CRASH_WINDOW]
+
+            # Create & log crash event
+            evt = make_event(
+                component="gateway",
+                exit_code=exit_code,
+                stderr_tail=stderr_tail,
+                crash_count=len(crash_times),
+                window_s=CRASH_WINDOW,
+                run_id=run_id,
+                event_type="crash",
+            )
+            append_event(evt)
+            record_crash(state, evt)
+
+            # Telegram notification (rate-limited)
+            if doc_cfg.notify_on_crash and tg_token:
+                send_telegram_alert(tg_token, tg_chat_ids, evt, tg_proxy)
+
+            if len(crash_times) >= MAX_CRASHES:
+                # ── Crash loop detected ──
+                console.print(
+                    f"[red]✗ {MAX_CRASHES} crashes in {CRASH_WINDOW}s — "
+                    f"crash loop detected.[/red]"
+                )
+
+                loop_evt = make_event(
+                    component="gateway",
+                    exit_code=exit_code,
+                    stderr_tail=stderr_tail,
+                    crash_count=len(crash_times),
+                    window_s=CRASH_WINDOW,
+                    run_id=run_id,
+                    event_type="crash_loop",
+                )
+                append_event(loop_evt)
+                record_crash_loop(state)
+
+                if tg_token:
+                    send_telegram_alert(tg_token, tg_chat_ids, loop_evt, tg_proxy)
+
+                # Auto-rollback (if enabled and applicable)
+                if doc_cfg.auto_rollback and should_attempt_rollback(state):
+                    target = state.get("last_good_commit", "")
                     console.print(
-                        f"[red]✗ {MAX_CRASHES} crashes in {CRASH_WINDOW}s — "
-                        f"crash loop detected. Waiting for file change...[/red]"
+                        f"[yellow]Attempting rollback to {target[:8]}...[/yellow]"
                     )
-                    # Wait for a file change before retrying
-                    while True:
-                        _time.sleep(1.5)
-                        new_snap = _snapshot()
-                        if any(last_snap.get(f) != new_snap.get(f)
-                               for f in set(list(last_snap.keys()) + list(new_snap.keys()))):
-                            crash_times.clear()
-                            break
-                        last_snap = new_snap
-                else:
-                    console.print(
-                        f"[dim]{_time.strftime('%H:%M:%S')}[/dim] "
-                        f"[red]✗[/red] Exit code {exit_code} — restarting in 2s..."
+                    cwd = str(src_dir.parent)
+                    try:
+                        gs = git_snapshot(cwd)
+                        from_commit = gs.commit
+                    except Exception:
+                        from_commit = "unknown"
+
+                    success, msg = safe_rollback(cwd, target)
+                    record_rollback(state, from_commit, target, success)
+
+                    rb_evt = make_event(
+                        component="gateway",
+                        exit_code=None,
+                        stderr_tail=msg,
+                        run_id=run_id,
+                        event_type="rollback",
                     )
-                    _time.sleep(2)
+                    append_event(rb_evt)
+                    if tg_token:
+                        send_telegram_alert(tg_token, tg_chat_ids, rb_evt, tg_proxy)
+
+                    if success:
+                        console.print(f"[green]Rollback succeeded: {msg}[/green]")
+                        crash_times.clear()
+                        continue
+                    else:
+                        console.print(f"[red]Rollback failed: {msg}[/red]")
+
+                # Wait for file change before retrying
+                console.print("[dim]Waiting for file change...[/dim]")
+                while True:
+                    _time.sleep(1.5)
+                    new_snap = _snapshot()
+                    if any(
+                        last_snap.get(f) != new_snap.get(f)
+                        for f in set(list(last_snap.keys()) + list(new_snap.keys()))
+                    ):
+                        crash_times.clear()
+                        break
+                    last_snap = new_snap
+            else:
+                console.print(
+                    f"[dim]{_time.strftime('%H:%M:%S')}[/dim] "
+                    f"[red]✗[/red] Exit code {exit_code} — restarting in 2s..."
+                )
+                _time.sleep(2)
+
         except KeyboardInterrupt:
             console.print("\n[dim]Shutting down...[/dim]")
-            if proc and hasattr(proc, 'terminate'):
+            if proc and hasattr(proc, "terminate"):
                 proc.terminate()
             break
+        finally:
+            if stderr_fh:
+                stderr_fh.close()
 
 
-def _run_gateway_subprocess():
+def _run_gateway_subprocess(stderr_fh=None):
     """Start `nanobot gateway` as a subprocess and return the Popen handle."""
     import subprocess
+
     return subprocess.Popen(
         [sys.executable, "-m", "nanobot", "gateway"],
         stdout=sys.stdout,
-        stderr=sys.stderr,
+        stderr=stderr_fh or sys.stderr,
     )
 
 

@@ -19,6 +19,7 @@ class TelegramConfig(BaseModel):
     token: str = ""  # Bot token from @BotFather
     allow_from: list[str] = Field(default_factory=list)  # Allowed user IDs or usernames
     proxy: str | None = None  # HTTP/SOCKS5 proxy URL, e.g. "http://127.0.0.1:7890" or "socks5://127.0.0.1:1080"
+    notify_chat_ids: list[str] = Field(default_factory=list)  # Chat IDs for doctor crash alerts (fallback: allow_from)
 
 
 class FeishuConfig(BaseModel):
@@ -223,6 +224,16 @@ class ToolsConfig(BaseModel):
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
 
 
+class DoctorConfig(BaseModel):
+    """Doctor control plane configuration."""
+    auto_rollback: bool = False       # Auto git rollback on crash loop (default off for dev)
+    stable_threshold_s: int = 120     # Seconds of stable run before recording last_good_commit
+    max_crashes: int = 5              # Crash count threshold for crash loop detection
+    crash_window_s: int = 60          # Time window (seconds) for counting crashes
+    notify_on_crash: bool = True      # Send Telegram alert on each crash
+    notify_on_startup: bool = False   # Send Telegram alert on gateway start
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
@@ -230,6 +241,7 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    doctor: DoctorConfig = Field(default_factory=DoctorConfig)
     
     @property
     def workspace_path(self) -> Path:

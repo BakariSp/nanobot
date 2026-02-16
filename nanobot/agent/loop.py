@@ -15,7 +15,7 @@ from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
 from nanobot.agent.context import ContextBuilder
-from nanobot.agent.prompts import followup_nudge_context
+from nanobot.agent.prompts import followup_nudge_context, zero_system_prompt, jarvis_system_prompt
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
 from nanobot.agent.tools.shell import ExecTool
@@ -26,6 +26,29 @@ from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import Session, SessionManager
+
+
+# ── Secretary command parsing ────────────────────────────────────
+
+_COMMANDS = {
+    r"^/p$":                      ("mode_switch", lambda m: "jarvis"),
+    r"^/jarvis$":                 ("mode_switch", lambda m: "jarvis"),
+    r"^/s$":                      ("mode_switch", lambda m: "zero"),
+    r"^/status$":                 ("status", lambda m: None),
+    r"^/approve\s+(T-\d+)$":     ("approve", lambda m: m.group(1)),
+    r"^/pause\s+(T-\d+)$":       ("pause", lambda m: m.group(1)),
+    r"^/cancel\s+(T-\d+)$":      ("cancel", lambda m: m.group(1)),
+}
+
+
+def parse_command(text: str) -> tuple[str, Any] | None:
+    """Parse secretary commands. Returns (action, arg) or None if not a command."""
+    text = text.strip()
+    for pattern, (action, extractor) in _COMMANDS.items():
+        m = re.match(pattern, text, re.IGNORECASE)
+        if m:
+            return (action, extractor(m))
+    return None
 
 
 class AgentLoop:
@@ -55,6 +78,8 @@ class AgentLoop:
         cron_service: "CronService | None" = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
+        task_ledger: "TaskLedger | None" = None,
+        dual_ledger: "DualLedger | None" = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         from nanobot.cron.service import CronService
@@ -70,6 +95,8 @@ class AgentLoop:
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
+        self.task_ledger = task_ledger
+        self.dual_ledger = dual_ledger
 
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
@@ -121,6 +148,23 @@ class AgentLoop:
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
 
+        # Task orchestration tools (secretary architecture)
+        from nanobot.agent.tools.worker import WorkerDispatchTool
+        from nanobot.agent.tools.task import TaskTool
+        from nanobot.agent.tools.task_query import TaskQueryTool
+
+        worker_tool = WorkerDispatchTool(
+            default_cwd=str(self.workspace),
+            ledger=self.task_ledger,
+            dual_ledger=self.dual_ledger,
+        )
+        self.tools.register(worker_tool)
+
+        self.tools.register(TaskTool(workspace=self.workspace))
+
+        if self.task_ledger:
+            self.tools.register(TaskQueryTool(ledger=self.task_ledger))
+
     def _set_tool_context(self, channel: str, chat_id: str) -> None:
         """Update context for all tools that need routing info."""
         if message_tool := self.tools.get("message"):
@@ -134,6 +178,123 @@ class AgentLoop:
         if cron_tool := self.tools.get("cron"):
             if isinstance(cron_tool, CronTool):
                 cron_tool.set_context(channel, chat_id)
+
+    # ── Secretary architecture helpers ──────────────────────────────
+
+    def _get_mode(self, session) -> str:
+        """Get current mode (zero or jarvis) from session metadata."""
+        return session.metadata.get("mode", "zero")
+
+    def _set_mode(self, session, mode: str) -> None:
+        """Set mode and persist to session."""
+        session.metadata["mode"] = mode
+        self.sessions.save(session)
+
+    def _check_notifications(self) -> str:
+        """Read and clear Ralph Loop completion notifications."""
+        if not self.dual_ledger:
+            return ""
+        notifications = self.dual_ledger.read_and_clear_notifications()
+        if not notifications:
+            return ""
+        lines = []
+        for n in notifications:
+            lines.append(f"[{n['task_id']}/{n['run_id']}] {n['status']}: {n['summary']}")
+        return "\n".join(lines)
+
+    def _build_mode_prompt(self, session) -> str:
+        """Build mode-specific system prompt (零号 or Jarvis).
+
+        For Zero mode, also loads USER.md, AGENTS.md, and the active task file
+        so they are part of the context (these are skipped when override_system_prompt
+        bypasses ContextBuilder.build_system_prompt).
+        """
+        mode = self._get_mode(session)
+        memory_context = self.context.memory.get_memory_context()
+        if mode == "jarvis":
+            status_context = self.dual_ledger.status_summary() if self.dual_ledger else ""
+            return jarvis_system_prompt(str(self.workspace), status_context)
+
+        base = zero_system_prompt(str(self.workspace), memory_context)
+
+        # Append workspace bootstrap files that zero_system_prompt doesn't include
+        extras = []
+        for filename in ("USER.md", "AGENTS.md"):
+            path = self.workspace / filename
+            if path.exists():
+                try:
+                    content = path.read_text(encoding="utf-8").strip()
+                    if content:
+                        extras.append(f"## {filename}\n{content}")
+                except OSError:
+                    pass
+
+        # Auto-inject active task file so Zero has task context without manual read_file
+        task_path = self.context.memory.get_active_task_path()
+        if task_path:
+            try:
+                task_content = task_path.read_text(encoding="utf-8").strip()
+                if task_content:
+                    rel = task_path.relative_to(self.workspace)
+                    extras.append(f"## Active Task File ({rel})\n{task_content}")
+            except (OSError, ValueError):
+                pass
+
+        if extras:
+            base += "\n\n" + "\n\n".join(extras)
+
+        return base
+
+    async def _handle_command(self, action: str, arg: Any, session, msg: InboundMessage) -> OutboundMessage:
+        """Handle secretary commands (bypass LLM, < 100ms)."""
+        if action == "mode_switch":
+            self._set_mode(session, arg)
+            if arg == "jarvis":
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content="Jarvis here. What do you want to look at?")
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                  content="好的，我回来了。")
+
+        if action == "status":
+            summary = self.dual_ledger.status_summary() if self.dual_ledger else "Task system not active."
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=summary)
+
+        if action in ("approve", "pause", "cancel"):
+            task_id = arg
+            if not self.dual_ledger:
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content="Task system not active.")
+            task = self.dual_ledger.get_task(task_id)
+            if not task:
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content=f"{task_id} doesn't exist.")
+
+            if action == "approve":
+                if task.status != "pending_approval":
+                    return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                          content=f"{task_id} is already {task.status}, no approval needed.")
+                self.dual_ledger.update_task_status(task_id, "todo")
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content=f"{task_id} approved, queued for execution.")
+
+            if action == "pause":
+                if task.status in ("done", "cancelled"):
+                    return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                          content=f"{task_id} is already {task.status}, can't pause.")
+                self.dual_ledger.update_task_status(task_id, "paused")
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content=f"{task_id} paused.")
+
+            # cancel
+            if task.status in ("done", "cancelled"):
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content=f"{task_id} is already {task.status}, can't cancel.")
+            self.dual_ledger.update_task_status(task_id, "cancelled")
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                  content=f"{task_id} cancelled.")
+
+        return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                              content=f"Unknown command: {action}")
 
     async def _run_agent_loop(self, initial_messages: list[dict]) -> tuple[str | None, list[str]]:
         """
@@ -289,13 +450,15 @@ class AgentLoop:
                 self._next_followup_at[chat_key] = now + random.uniform(600, 1800)
                 continue
 
-            system_prompt = self.context.build_system_prompt()
+            # Use 零号's prompt for follow-ups (always in secretary mode)
+            memory_context = self.context.memory.get_memory_context()
+            system_prompt = zero_system_prompt(str(self.workspace), memory_context)
             max_history = min(self.memory_window, 20)
             history = session.get_history(max_messages=max_history)
 
-            # The nudge is injected as a user-role message so the LLM sees
-            # the full conversation before deciding whether to say something.
-            nudge = followup_nudge_context(silent_minutes)
+            # Include task status in follow-up context
+            task_summary = self.dual_ledger.status_summary() if self.dual_ledger else ""
+            nudge = followup_nudge_context(silent_minutes, task_summary=task_summary)
             messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
             messages.extend(history)
             messages.append({"role": "user", "content": nudge})
@@ -377,12 +540,65 @@ class AgentLoop:
             asyncio.create_task(_consolidate_and_cleanup())
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started. Memory consolidation in progress.")
-        if cmd == "/help":
+        if cmd == "/archive":
+            if not session.messages:
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content="Nothing to archive — session is empty.")
+            messages_to_archive = session.messages.copy()
+            session.clear()
+            self.sessions.save(session)
+            self.sessions.invalidate(session.key)
+
+            async def _archive_and_cleanup():
+                temp_session = Session(key=session.key)
+                temp_session.messages = messages_to_archive
+                await self._consolidate_memory(temp_session, archive_all=True)
+
+            asyncio.create_task(_archive_and_cleanup())
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="\U0001f408 nanobot commands:\n/new \u2014 Start a new conversation\n/help \u2014 Show available commands")
+                                  content="Conversation archived to memory. Session cleared.")
+        if cmd == "/discard":
+            if not session.messages:
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content="Nothing to discard — session is empty.")
+            count = len(session.messages)
+            session.clear()
+            self.sessions.save(session)
+            self.sessions.invalidate(session.key)
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                  content=f"Discarded {count} messages. Session cleared, nothing saved to memory.")
+        if cmd == "/help":
+            mode = self._get_mode(session)
+            mode_label = "Jarvis (planner)" if mode == "jarvis" else "零号 (secretary)"
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                  content=f"\U0001f408 nanobot commands:\n"
+                                          f"/new \u2014 New conversation (archive + clear)\n"
+                                          f"/archive \u2014 Archive conversation to memory\n"
+                                          f"/discard \u2014 Discard conversation (no memory)\n"
+                                          f"/p \u2014 Switch to Jarvis (planner)\n"
+                                          f"/s \u2014 Switch to 零号 (secretary)\n"
+                                          f"/status \u2014 Task queue status\n"
+                                          f"/approve T-xxx \u2014 Approve L3 task\n"
+                                          f"/pause T-xxx \u2014 Pause task\n"
+                                          f"/cancel T-xxx \u2014 Cancel task\n"
+                                          f"\nCurrent mode: {mode_label}")
+
+        # Secretary architecture commands (bypass LLM, < 100ms)
+        parsed = parse_command(msg.content)
+        if parsed:
+            action, arg = parsed
+            return await self._handle_command(action, arg, session, msg)
 
         if len(session.messages) > self.memory_window:
             asyncio.create_task(self._consolidate_memory(session))
+
+        # Check Ralph Loop notifications
+        notification_context = self._check_notifications()
+
+        # Build mode-specific system prompt (零号 or Jarvis)
+        system_prompt = self._build_mode_prompt(session)
+        if notification_context:
+            system_prompt += f"\n\n## Recent Task Completions\n{notification_context}"
 
         self._set_tool_context(msg.channel, msg.chat_id)
         initial_messages = self.context.build_messages(
@@ -391,6 +607,7 @@ class AgentLoop:
             media=msg.media if msg.media else None,
             channel=msg.channel,
             chat_id=msg.chat_id,
+            override_system_prompt=system_prompt,
         )
         final_content, tools_used = await self._run_agent_loop(initial_messages)
 
@@ -493,12 +710,42 @@ class AgentLoop:
         conversation = "\n".join(lines)
         current_memory = memory.read_long_term()
 
+        # Load SOUL.md and USER.md so the consolidation LLM knows what NOT to duplicate
+        soul_content = ""
+        user_content = ""
+        try:
+            soul_path = self.workspace / "SOUL.md"
+            if soul_path.exists():
+                soul_content = soul_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+        try:
+            user_path = self.workspace / "USER.md"
+            if user_path.exists():
+                user_content = user_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+
+        dedup_section = ""
+        if soul_content or user_content:
+            dedup_section = "\n## Already Stored Elsewhere (DO NOT duplicate into memory_update)\n"
+            if soul_content:
+                dedup_section += f"\n### SOUL.md (agent identity — canonical source)\n{soul_content}\n"
+            if user_content:
+                dedup_section += f"\n### USER.md (user profile — canonical source)\n{user_content}\n"
+
         prompt = f"""You are a memory consolidation agent. Process this conversation and return a JSON object with exactly two keys:
 
 1. "history_entry": A paragraph (2-5 sentences) summarizing the key events/decisions/topics. Start with a timestamp like [YYYY-MM-DD HH:MM]. Include enough detail to be useful when found by grep search later.
 
-2. "memory_update": The updated long-term memory content. Add any new facts: user location, preferences, personal info, habits, project context, technical decisions, tools/services used. If nothing new, return the existing content unchanged.
+2. "memory_update": The updated long-term memory content. Only add NEW facts discovered in the conversation: evolving user behavior patterns, project runtime discoveries, technical decisions, task context. If nothing new, return the existing content unchanged.
 
+CRITICAL RULES for memory_update:
+- DO NOT repeat information already in SOUL.md or USER.md (shown below). Those files are the canonical source for identity and user profile.
+- DO NOT store static facts like agent name, age, location, personality, or user name/language/timezone — those belong in SOUL.md / USER.md.
+- ONLY store: learned behavior patterns, project-specific discoveries, evolved rules, active task state.
+- If existing memory_update contains duplicates of SOUL.md/USER.md content, REMOVE them.
+{dedup_section}
 ## Current Long-term Memory
 {current_memory or "(empty)"}
 
