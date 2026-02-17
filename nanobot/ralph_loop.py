@@ -142,6 +142,33 @@ class Heartbeat:
             return False
 
 
+# ── Raw Output Capture ────────────────────────────────────────────
+
+RAW_OUTPUT_DIR = Path.home() / ".nanobot" / "data" / "reports"
+
+
+def _save_raw_output(run_id: str, raw: str) -> None:
+    """Save raw worker stdout/stderr to W-XXX.raw.log for inspection."""
+    RAW_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    path = RAW_OUTPUT_DIR / f"{run_id}.raw.log"
+    try:
+        path.write_text(raw, encoding="utf-8")
+        logger.info(f"Raw output saved → {path} ({len(raw)} chars)")
+    except OSError as e:
+        logger.warning(f"Failed to save raw output for {run_id}: {e}")
+
+
+def get_raw_output(run_id: str) -> str | None:
+    """Read raw worker output. Returns None if not found."""
+    path = RAW_OUTPUT_DIR / f"{run_id}.raw.log"
+    if not path.exists():
+        return None
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
 # ── Worker Execution ──────────────────────────────────────────────
 
 def _build_worker_prompt(task: TaskDefinition) -> str:
@@ -267,13 +294,18 @@ async def execute_worker(
             run.duration_s = round(time.monotonic() - start_time, 1)
             run.summary = f"Worker timed out after {WORKER_TIMEOUT}s"
             run.failure_diagnosis = "worker_hang"
+            # Capture partial output before timeout
+            _save_raw_output(run.run_id, f"[TIMEOUT after {WORKER_TIMEOUT}s]\n(partial output not available after kill)")
             return run
 
         run.duration_s = round(time.monotonic() - start_time, 1)
         run.exit_code = proc.returncode or 0
         raw = stdout.decode("utf-8", errors="replace")
         if stderr:
-            raw += "\n" + stderr.decode("utf-8", errors="replace")
+            raw += "\n--- STDERR ---\n" + stderr.decode("utf-8", errors="replace")
+
+        # Save raw output for later inspection
+        _save_raw_output(run.run_id, raw)
 
         # Auth failure detection
         if proc.returncode != 0 and _detect_auth_failure(raw):
@@ -300,6 +332,7 @@ async def execute_worker(
         run.status = "failed"
         run.summary = f"Execution error: {str(e)}"
         run.failure_diagnosis = "worker_error"
+        _save_raw_output(run.run_id, f"[EXCEPTION] {e}")
         return run
 
 
@@ -314,6 +347,91 @@ def recover_orphaned_tasks(ledger: DualLedger) -> int:
         ledger.update_task_status(task.task_id, "blocked")
         recovered += 1
     return recovered
+
+
+# ── Notion sync ──────────────────────────────────────────────────
+
+
+def _load_notion_config() -> tuple[str, str]:
+    """Load Notion API token and database ID from nanobot config.
+
+    Returns:
+        (api_token, database_id) — both empty strings if not configured.
+    """
+    config_path = Path.home() / ".nanobot" / "config.json"
+    if not config_path.exists():
+        return "", ""
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+        notion = data.get("tools", {}).get("notion", {})
+        return notion.get("api_token", notion.get("apiToken", "")), notion.get(
+            "database_id", notion.get("databaseId", "")
+        )
+    except (json.JSONDecodeError, OSError):
+        return "", ""
+
+
+# Cache config at module level (loaded once on first call)
+_notion_api_token: str | None = None
+_notion_database_id: str | None = None
+
+
+async def _sync_run_to_notion(run: WorkerRunRecord) -> str | None:
+    """Save a completed worker run to Notion with Type=Worker Report.
+
+    Returns:
+        Page URL on success, None on failure or if Notion is not configured.
+    """
+    global _notion_api_token, _notion_database_id
+    if _notion_api_token is None:
+        _notion_api_token, _notion_database_id = _load_notion_config()
+
+    if not _notion_api_token or not _notion_database_id:
+        return None
+
+    try:
+        from nanobot.agent.tools.notion_save import create_notion_page
+
+        # Build a concise markdown report
+        lines = [
+            f"# Worker Report: {run.run_id}",
+            "",
+            f"| Field | Value |",
+            f"|---|---|",
+            f"| **Run ID** | {run.run_id} |",
+            f"| **Task ID** | {run.task_id} |",
+            f"| **Status** | {run.status} |",
+            f"| **Model** | {run.model} |",
+            f"| **Duration** | {run.duration_s}s |",
+            f"| **Exit Code** | {run.exit_code} |",
+            "",
+            "## Summary",
+            run.summary or "(no summary)",
+        ]
+        if run.files_changed:
+            lines += ["", "## Files Changed"]
+            for f in run.files_changed:
+                lines.append(f"- `{f}`")
+        if run.checks:
+            lines += ["", "## Quality Checks", "| Check | Result |", "|---|---|"]
+            for k, v in run.checks.items():
+                lines.append(f"| {k} | {v} |")
+
+        content = "\n".join(lines)
+        url = await create_notion_page(
+            api_token=_notion_api_token,
+            database_id=_notion_database_id,
+            title=f"Worker Report {run.run_id}",
+            content=content,
+            tags=["worker-report", run.status],
+            content_type="Worker Report",
+        )
+        if url:
+            logger.info(f"Notion sync OK for {run.run_id}: {url}")
+        return url
+    except Exception as e:
+        logger.warning(f"Notion sync failed for {run.run_id}: {e}")
+        return None
 
 
 # ── Main Loop ─────────────────────────────────────────────────────
@@ -393,6 +511,9 @@ async def ralph_loop() -> None:
                 else:
                     ledger.update_task_status(task.task_id, "blocked")
                     logger.warning(f"{task.task_id} failed {retry_count} times, marking blocked")
+
+            # Sync to Notion
+            await _sync_run_to_notion(run)
 
             # Notify 零号
             ledger.append_notification(
