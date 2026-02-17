@@ -82,13 +82,22 @@ class LiteLLMProvider(LLMProvider):
             if prefix and not model.startswith(f"{prefix}/"):
                 model = f"{prefix}/{model}"
             return model
-        
+
         # Standard mode: auto-prefix for known providers
         spec = find_by_model(model)
+
+        # DashScope (百炼): route via OpenAI-compatible endpoint.
+        # LiteLLM's native dashscope/ handler strips image_url from
+        # multimodal messages.  Using openai/ prefix with the compatible
+        # endpoint preserves images correctly.
+        if spec and spec.name == "dashscope":
+            bare = model.split("/", 1)[-1] if "/" in model else model
+            return f"openai/{bare}"
+
         if spec and spec.litellm_prefix:
             if not any(model.startswith(s) for s in spec.skip_prefixes):
                 model = f"{spec.litellm_prefix}/{model}"
-        
+
         return model
     
     def _apply_model_overrides(self, model: str, kwargs: dict[str, Any]) -> None:
@@ -122,29 +131,36 @@ class LiteLLMProvider(LLMProvider):
         Returns:
             LLMResponse with content and/or tool calls.
         """
-        model = self._resolve_model(model or self.default_model)
-        
+        raw_model = model or self.default_model
+        model = self._resolve_model(raw_model)
+
         # Clamp max_tokens to at least 1 — negative or zero values cause
         # LiteLLM to reject the request with "max_tokens must be at least 1".
         max_tokens = max(1, max_tokens)
-        
+
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
-        
+
         # Apply model-specific overrides (e.g. kimi-k2.5 temperature)
         self._apply_model_overrides(model, kwargs)
-        
+
         # Pass api_key directly — more reliable than env vars alone
         if self.api_key:
             kwargs["api_key"] = self.api_key
-        
+
         # Pass api_base for custom endpoints
         if self.api_base:
             kwargs["api_base"] = self.api_base
+        else:
+            # Use provider's default base URL when no explicit api_base is set.
+            # E.g. DashScope → https://dashscope.aliyuncs.com/compatible-mode/v1
+            spec = find_by_model(raw_model)
+            if spec and spec.default_api_base:
+                kwargs["api_base"] = spec.default_api_base
         
         # Pass extra headers (e.g. APP-Code for AiHubMix)
         if self.extra_headers:
@@ -198,9 +214,11 @@ class LiteLLMProvider(LLMProvider):
         content = message.content
 
         # Debug: log raw fields for thinking-model diagnostics
+        finish = choice.finish_reason
         if reasoning_content or (content and "<think>" in content):
             logger.debug(
-                f"Thinking model raw: content={content[:120] if content else None!r}, "
+                f"Thinking model raw: finish_reason={finish!r}, "
+                f"content={content[:120] if content else None!r}, "
                 f"reasoning_content={reasoning_content[:80] if reasoning_content else None!r}"
             )
 
@@ -216,6 +234,16 @@ class LiteLLMProvider(LLMProvider):
                     reasoning_content = think_match.group(1).strip()
                 content = content[:think_match.start()] + content[think_match.end():]
                 content = content.strip() or None
+            else:
+                # Unclosed <think> — response was truncated mid-reasoning
+                # (finish_reason="length").  Extract what we have as
+                # reasoning and discard the garbled content.
+                open_idx = content.index("<think>")
+                thinking_fragment = content[open_idx + len("<think>"):].strip()
+                before_think = content[:open_idx].strip()
+                if not reasoning_content and thinking_fragment:
+                    reasoning_content = thinking_fragment
+                content = before_think or None
 
         return LLMResponse(
             content=content,

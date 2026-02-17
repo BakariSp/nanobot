@@ -213,20 +213,22 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         model_overrides=(),
     ),
 
-    # DashScope: Qwen models, needs "dashscope/" prefix.
+    # DashScope (百炼): Qwen models via OpenAI-compatible endpoint.
+    # Routes through openai/ prefix to avoid LiteLLM's native dashscope
+    # handler which strips image_url content from multimodal messages.
     ProviderSpec(
         name="dashscope",
         keywords=("qwen", "dashscope"),
         env_key="DASHSCOPE_API_KEY",
-        display_name="DashScope",
-        litellm_prefix="dashscope",         # qwen-max → dashscope/qwen-max
+        display_name="DashScope (百炼)",
+        litellm_prefix="dashscope",         # kept for reference; _resolve_model overrides
         skip_prefixes=("dashscope/", "openrouter/"),
         env_extras=(),
         is_gateway=False,
         is_local=False,
         detect_by_key_prefix="",
         detect_by_base_keyword="",
-        default_api_base="",
+        default_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
         strip_model_prefix=False,
         model_overrides=(),
     ),
