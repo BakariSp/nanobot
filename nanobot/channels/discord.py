@@ -78,6 +78,11 @@ class DiscordChannel(BaseChannel):
             logger.warning("Discord HTTP client not initialized")
             return
 
+        # Silent message — only needed to cancel the typing indicator
+        if msg.metadata.get("_silent"):
+            await self._stop_typing(msg.chat_id)
+            return
+
         url = f"{DISCORD_API_BASE}/channels/{msg.chat_id}/messages"
         payload: dict[str, Any] = {"content": msg.content}
 

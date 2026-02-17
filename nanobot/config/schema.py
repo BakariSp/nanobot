@@ -217,11 +217,41 @@ class ExecToolConfig(BaseModel):
     timeout: int = 60
 
 
+class NotionConfig(BaseModel):
+    """Notion integration configuration."""
+    api_token: str = ""       # Notion Integration token (secret_xxx)
+    database_id: str = ""     # Default database ID for saving pages
+
+
+class ImageGenConfig(BaseModel):
+    """Image generation tool configuration (Volcengine Seedream)."""
+    ark_api_key: str = ""
+    ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
+    ark_image_model: str = "doubao-seedream-3-0-t2i-250415"
+
+
+class TTSToolConfig(BaseModel):
+    """TTS tool configuration."""
+    provider: str = "dashscope"  # "dashscope" or "volcengine"
+    dashscope_api_key: str = ""  # Falls back to providers.dashscope.api_key
+    volcengine_app_id: str = ""
+    volcengine_token: str = ""
+    default_voice: str = ""
+
+
 class ToolsConfig(BaseModel):
     """Tools configuration."""
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
+    notion: NotionConfig = Field(default_factory=NotionConfig)
+    image_gen: ImageGenConfig = Field(default_factory=ImageGenConfig)
+    tts: TTSToolConfig = Field(default_factory=TTSToolConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
+
+
+# ── MCP integration ──────────────────────────────────────────
+
+from nanobot.mcp.types import MCPConfig  # noqa: E402
 
 
 class DoctorConfig(BaseModel):
@@ -241,6 +271,7 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    mcp: MCPConfig = Field(default_factory=MCPConfig)
     doctor: DoctorConfig = Field(default_factory=DoctorConfig)
     
     @property

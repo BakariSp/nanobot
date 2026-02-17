@@ -196,11 +196,45 @@ class TelegramChannel(BaseChannel):
         
         # Stop typing indicator for this chat
         self._stop_typing(msg.chat_id)
-        
+
+        # Silent message — only needed to cancel the typing indicator
+        if msg.metadata.get("_silent"):
+            return
+
         try:
-            # chat_id should be the Telegram chat ID (integer)
             chat_id = int(msg.chat_id)
-            # Convert markdown to Telegram HTML
+
+            # Handle media attachments (photo / voice)
+            if msg.media:
+                media_type = msg.metadata.get("type", "photo")
+                for media_path in msg.media:
+                    try:
+                        with open(media_path, 'rb') as media_file:
+                            if media_type == "voice":
+                                await self._app.bot.send_voice(
+                                    chat_id=chat_id,
+                                    voice=media_file,
+                                    caption=msg.content if msg.content else None,
+                                    parse_mode="HTML" if msg.content else None,
+                                )
+                                logger.info(f"Sent voice: {media_path}")
+                            else:
+                                await self._app.bot.send_photo(
+                                    chat_id=chat_id,
+                                    photo=media_file,
+                                    caption=msg.content if msg.content else None,
+                                    parse_mode="HTML" if msg.content else None,
+                                )
+                                logger.info(f"Sent photo: {media_path}")
+                    except Exception as e:
+                        logger.error(f"Failed to send {media_type} {media_path}: {e}")
+                        if msg.content:
+                            await self._app.bot.send_message(
+                                chat_id=chat_id, text=msg.content
+                            )
+                return
+
+            # Text-only message
             html_content = _markdown_to_telegram_html(msg.content)
             await self._app.bot.send_message(
                 chat_id=chat_id,

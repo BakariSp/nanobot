@@ -747,6 +747,50 @@ nanobot/
 └── cli/            # 🖥️ Commands
 ```
 
+## 💾 Data Storage
+
+所有运行时数据存储在 `~/.nanobot/` 下：
+
+```
+~/.nanobot/
+├── config.json                              # 全局配置 (providers, channels, agents, tools)
+├── sessions/                                # 会话历史 (per chat)
+│   └── {channel}_{chat_id}.jsonl            #   首行 _type:metadata, 后续为消息
+├── logs/conversations/                      # 对话归档 (per day, append-only)
+│   └── YYYY-MM-DD.jsonl                     #   每行一条消息, 用于训练/审计
+├── data/
+│   ├── cron/jobs.json                       # 定时任务
+│   └── reports/W-NNN.md                     # Worker 报告
+└── workspace/                               # Agent workspace
+    ├── SOUL.md / AGENTS.md / TOOLS.md       #   Agent 人设 & 操作手册
+    ├── memory/MEMORY.md                     #   长期记忆
+    ├── memory/HISTORY.md                    #   事件日志
+    ├── memory/diary/YYYY-MM-DD.md           #   每日日记
+    ├── memory/tasks/{slug}.md               #   任务工作笔记
+    └── skills/                              #   自定义技能
+```
+
+### Session JSONL 格式
+
+```jsonl
+{"_type":"metadata","created_at":"...","updated_at":"...","metadata":{},"last_consolidated":0}
+{"role":"user","content":"你好","timestamp":"2026-02-17T00:30:00"}
+{"role":"assistant","content":"嗨！","timestamp":"...","tools_used":["web_search"],"reasoning_content":"..."}
+```
+
+- `tools_used`: 可选，本轮使用的工具列表
+- `reasoning_content`: 可选，thinking 模型 (DeepSeek-R1, Qwen 3 等) 的推理链
+
+### Conversation Archive JSONL 格式
+
+```jsonl
+{"ts":"2026-02-17T00:30:00+00:00","ts_local":"2026-02-17 08:30:00","direction":"in","channel":"telegram","chat_id":"123","sender_id":"user","content":"你好"}
+{"ts":"...","direction":"out","channel":"telegram","chat_id":"123","sender_id":"","content":"嗨！","tools_used":["web_search"],"reasoning_content":"...","metadata":{"trigger":"followup","silent_minutes":5}}
+```
+
+- `direction`: `in` (用户消息) / `out` (agent 回复) / `system`
+- `metadata.trigger`: 可选，`followup` = 主动跟进，`startup_greeting` = 启动问候
+
 ## 🤝 Contribute & Roadmap
 
 PRs welcome! The codebase is intentionally small and readable. 🤗

@@ -353,8 +353,13 @@ def gateway(
         session_manager=session_manager,
         task_ledger=task_ledger,
         dual_ledger=dual_ledger,
+        mcp_config=config.mcp,
+        notion_config=config.tools.notion,
+        image_gen_config=config.tools.image_gen,
+        tts_config=config.tools.tts,
+        dashscope_api_key=(config.providers.dashscope.api_key or ""),
     )
-    
+
     # Set cron callback (needs agent)
     async def on_cron_job(job: CronJob) -> str | None:
         """Execute a cron job through the agent."""
@@ -388,7 +393,8 @@ def gateway(
     
     # Create channel manager
     channels = ChannelManager(config, bus)
-    
+    agent._enabled_channels = set(channels.enabled_channels)
+
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
     else:
@@ -470,8 +476,13 @@ def agent(
         restrict_to_workspace=config.tools.restrict_to_workspace,
         task_ledger=task_ledger,
         dual_ledger=dual_ledger,
+        mcp_config=config.mcp,
+        notion_config=config.tools.notion,
+        image_gen_config=config.tools.image_gen,
+        tts_config=config.tools.tts,
+        dashscope_api_key=(config.providers.dashscope.api_key or ""),
     )
-    
+
     # Show spinner when logs are off (no output to miss); skip when logs are on
     def _thinking_ctx():
         if logs:

@@ -40,6 +40,7 @@ dependencies = [
     "prompt-toolkit>=3.0.0",
     "notion-client>=2.0.0",
     "telethon>=1.36.0",
+    "mcp>=1.0.0",
 ]
 
 [project.optional-dependencies]
