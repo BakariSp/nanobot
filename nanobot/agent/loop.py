@@ -15,7 +15,7 @@ from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
 from nanobot.agent.context import ContextBuilder
-from nanobot.agent.prompts import followup_nudge_context, startup_greeting_context, zero_system_prompt, jarvis_system_prompt
+from nanobot.agent.prompts import diary_catchup_prompt, followup_nudge_context, startup_greeting_context, zero_system_prompt, jarvis_system_prompt
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
 from nanobot.agent.tools.shell import ExecTool
@@ -23,9 +23,23 @@ from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.cron import CronTool
+from nanobot.agent.tools.send_photo import SendPhotoTool
+from nanobot.agent.tools.voice_reply import VoiceReplyTool
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import Session, SessionManager
+
+
+# ── Output sanitisation ──────────────────────────────────────────
+
+# Matches timestamp prefixes that the LLM sometimes mimics from history,
+# e.g. "[2026-02-17T01:00] " or "[2026-02-17 01:00] "
+_TS_PREFIX_RE = re.compile(r"^\[?\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}\]?\s*")
+
+
+def _strip_ts_prefix(text: str) -> str:
+    """Remove timestamp prefix from LLM output if the model copied it from history."""
+    return _TS_PREFIX_RE.sub("", text).strip()
 
 
 # ── Conversation archive (append-only, for future model training) ──
@@ -42,6 +56,7 @@ def _archive_message(
     sender_id: str = "",
     tools_used: list[str] | None = None,
     metadata: dict | None = None,
+    reasoning_content: str | None = None,
 ) -> None:
     """Append a single message to the daily conversation JSONL file.
 
@@ -63,6 +78,8 @@ def _archive_message(
         entry["tools_used"] = tools_used
     if metadata:
         entry["metadata"] = metadata
+    if reasoning_content:
+        entry["reasoning_content"] = reasoning_content
 
     path = _CONVO_LOG_DIR / f"{now.strftime('%Y-%m-%d')}.jsonl"
     try:
@@ -124,8 +141,13 @@ class AgentLoop:
         session_manager: SessionManager | None = None,
         task_ledger: "TaskLedger | None" = None,
         dual_ledger: "DualLedger | None" = None,
+        mcp_config: "Any | None" = None,  # MCPConfig from nanobot.mcp.types
+        notion_config: "Any | None" = None,  # NotionConfig from nanobot.config.schema
+        image_gen_config: "Any | None" = None,  # ImageGenConfig
+        tts_config: "Any | None" = None,  # TTSToolConfig
+        dashscope_api_key: str = "",  # Fallback for TTS if tts_config.dashscope_api_key is empty
     ):
-        from nanobot.config.schema import ExecToolConfig
+        from nanobot.config.schema import ExecToolConfig, NotionConfig, ImageGenConfig, TTSToolConfig
         from nanobot.cron.service import CronService
         self.bus = bus
         self.provider = provider
@@ -141,6 +163,10 @@ class AgentLoop:
         self.restrict_to_workspace = restrict_to_workspace
         self.task_ledger = task_ledger
         self.dual_ledger = dual_ledger
+        self.config_notion = notion_config or NotionConfig()
+        self.config_image_gen = image_gen_config or ImageGenConfig()
+        self.config_tts = tts_config or TTSToolConfig()
+        self.dashscope_api_key = dashscope_api_key
 
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
@@ -158,7 +184,14 @@ class AgentLoop:
         )
 
         self._running = False
+        self._enabled_channels: set[str] | None = None  # Set after ChannelManager init
         self._register_default_tools()
+
+        # MCP integration (lazy — connects in run())
+        self._mcp_manager = None
+        if mcp_config and mcp_config.enabled:
+            from nanobot.mcp.manager import MCPManager
+            self._mcp_manager = MCPManager(mcp_config, self.tools)
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -192,15 +225,34 @@ class AgentLoop:
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
 
+        # Notion tools (save pages + manage tasks)
+        from nanobot.agent.tools.notion_save import SaveToNotionTool
+        from nanobot.agent.tools.notion_tasks import NotionTasksTool
+
+        notion_cfg = self.config_notion
+        notion_tool: SaveToNotionTool | None = None
+        if notion_cfg.api_token and notion_cfg.database_id:
+            notion_tool = SaveToNotionTool(
+                api_token=notion_cfg.api_token,
+                database_id=notion_cfg.database_id,
+            )
+            self.tools.register(notion_tool)
+            self.tools.register(NotionTasksTool(
+                api_token=notion_cfg.api_token,
+                database_id=notion_cfg.database_id,
+            ))
+
         # Task orchestration tools (secretary architecture)
         from nanobot.agent.tools.worker import WorkerDispatchTool
         from nanobot.agent.tools.task import TaskTool
         from nanobot.agent.tools.task_query import TaskQueryTool
+        from nanobot.agent.tools.worker_logs import WorkerLogsTool
 
         worker_tool = WorkerDispatchTool(
             default_cwd=str(self.workspace),
             ledger=self.task_ledger,
             dual_ledger=self.dual_ledger,
+            notion_tool=notion_tool,
         )
         self.tools.register(worker_tool)
 
@@ -208,6 +260,41 @@ class AgentLoop:
 
         if self.task_ledger:
             self.tools.register(TaskQueryTool(ledger=self.task_ledger))
+
+        if self.dual_ledger:
+            self.tools.register(WorkerLogsTool(dual_ledger=self.dual_ledger))
+
+        # Image generation tool (Volcengine Seedream)
+        ig = self.config_image_gen
+        if ig.ark_api_key:
+            self.tools.register(SendPhotoTool(
+                send_callback=self.bus.publish_outbound,
+                ark_api_key=ig.ark_api_key,
+                ark_base_url=ig.ark_base_url,
+                ark_image_model=ig.ark_image_model,
+            ))
+
+        # Voice reply tool (TTS)
+        tts_cfg = self.config_tts
+        tts_api_key = tts_cfg.dashscope_api_key or self.dashscope_api_key
+        if tts_cfg.provider == "volcengine" and tts_cfg.volcengine_app_id:
+            from nanobot.providers.volcengine_tts import VolcengineTTSProvider
+            tts_provider = VolcengineTTSProvider(
+                app_id=tts_cfg.volcengine_app_id,
+                token=tts_cfg.volcengine_token,
+                default_voice=tts_cfg.default_voice or None,
+            )
+            self.tools.register(VoiceReplyTool(
+                send_callback=self.bus.publish_outbound,
+                tts_provider=tts_provider,
+            ))
+        elif tts_api_key:
+            from nanobot.providers.tts import DashScopeTTSProvider
+            tts_provider = DashScopeTTSProvider(api_key=tts_api_key)
+            self.tools.register(VoiceReplyTool(
+                send_callback=self.bus.publish_outbound,
+                tts_provider=tts_provider,
+            ))
 
     def _set_tool_context(self, channel: str, chat_id: str) -> None:
         """Update context for all tools that need routing info."""
@@ -223,6 +310,14 @@ class AgentLoop:
             if isinstance(cron_tool, CronTool):
                 cron_tool.set_context(channel, chat_id)
 
+        if photo_tool := self.tools.get("send_photo"):
+            if isinstance(photo_tool, SendPhotoTool):
+                photo_tool.set_context(channel, chat_id)
+
+        if voice_tool := self.tools.get("voice_reply"):
+            if isinstance(voice_tool, VoiceReplyTool):
+                voice_tool.set_context(channel, chat_id)
+
     # ── Secretary architecture helpers ──────────────────────────────
 
     def _get_mode(self, session) -> str:
@@ -235,7 +330,11 @@ class AgentLoop:
         self.sessions.save(session)
 
     def _check_notifications(self) -> str:
-        """Read and clear Ralph Loop completion notifications."""
+        """Read and clear Ralph Loop completion notifications.
+
+        For failed runs, includes failure diagnosis and a hint to use worker_logs
+        for detailed inspection.
+        """
         if not self.dual_ledger:
             return ""
         notifications = self.dual_ledger.read_and_clear_notifications()
@@ -243,7 +342,15 @@ class AgentLoop:
             return ""
         lines = []
         for n in notifications:
-            lines.append(f"[{n['task_id']}/{n['run_id']}] {n['status']}: {n['summary']}")
+            line = f"[{n['task_id']}/{n['run_id']}] {n['status']}: {n['summary']}"
+            # Enrich failed notifications with run details
+            if n['status'] == 'failed' and self.dual_ledger:
+                run = self.dual_ledger.get_run(n['run_id'])
+                if run:
+                    if run.failure_diagnosis:
+                        line += f" (diagnosis: {run.failure_diagnosis})"
+                    line += f" — use worker_logs(get_output, {n['run_id']}) for full log"
+            lines.append(line)
         return "\n".join(lines)
 
     def _build_mode_prompt(self, session) -> str:
@@ -340,7 +447,7 @@ class AgentLoop:
         return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                               content=f"Unknown command: {action}")
 
-    async def _run_agent_loop(self, initial_messages: list[dict]) -> tuple[str | None, list[str]]:
+    async def _run_agent_loop(self, initial_messages: list[dict]) -> tuple[str | None, list[str], str | None]:
         """
         Run the agent iteration loop.
 
@@ -348,12 +455,13 @@ class AgentLoop:
             initial_messages: Starting messages for the LLM conversation.
 
         Returns:
-            Tuple of (final_content, list_of_tools_used).
+            Tuple of (final_content, list_of_tools_used, reasoning_content).
         """
         messages = initial_messages
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        last_reasoning: str | None = None
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -365,6 +473,9 @@ class AgentLoop:
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
             )
+
+            if response.reasoning_content:
+                last_reasoning = response.reasoning_content
 
             if response.has_tool_calls:
                 tool_call_dicts = [
@@ -393,10 +504,39 @@ class AgentLoop:
                     )
                 messages.append({"role": "user", "content": "Reflect on the results and decide next steps."})
             else:
+                # ── Thinking-model truncation guard ───────────────
+                # For models that return reasoning_content (DeepSeek-R1,
+                # Kimi, etc.), max_tokens is the *total* budget for both
+                # reasoning and visible content.  When the model exhausts
+                # the budget on thinking, finish_reason is "length" and
+                # the actual reply is truncated or garbled.
+                # Retry once with a larger budget so the model can finish.
+                if (
+                    response.finish_reason == "length"
+                    and response.reasoning_content
+                ):
+                    bumped = min(self.max_tokens * 2, 32768)
+                    logger.warning(
+                        f"Thinking model truncated (finish_reason=length, "
+                        f"reasoning={len(response.reasoning_content)} chars), "
+                        f"retrying with max_tokens={bumped}"
+                    )
+                    retry = await self.provider.chat(
+                        messages=messages,
+                        tools=self.tools.get_definitions(),
+                        model=self.model,
+                        temperature=self.temperature,
+                        max_tokens=bumped,
+                    )
+                    if retry.reasoning_content:
+                        last_reasoning = retry.reasoning_content
+                    if retry.finish_reason != "length" and retry.content:
+                        response = retry
+
                 final_content = response.content
                 break
 
-        return final_content, tools_used
+        return final_content, tools_used, last_reasoning
 
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
@@ -411,6 +551,13 @@ class AgentLoop:
         self._next_followup_at: dict[tuple[str, str], float] = {}
 
         logger.info("Agent loop started")
+
+        # ── Start MCP servers ──────────────────────────────────────
+        if self._mcp_manager:
+            try:
+                await self._mcp_manager.start()
+            except Exception as e:
+                logger.error(f"MCP Manager start failed (non-fatal): {e}")
 
         # ── Restore active chats from session history & send startup greeting ──
         await self._startup_greet()
@@ -431,7 +578,25 @@ class AgentLoop:
                 try:
                     response = await self._process_message(msg)
                     if response:
-                        await self.bus.publish_outbound(response)
+                        # Split on --- like startup/followup paths (multi-bubble)
+                        parts = [p.strip() for p in re.split(r"\n---\n", response.content) if p.strip()]
+                        for i, part in enumerate(parts):
+                            await self.bus.publish_outbound(OutboundMessage(
+                                channel=response.channel,
+                                chat_id=response.chat_id,
+                                content=part,
+                                metadata=response.metadata,
+                            ))
+                            if i < len(parts) - 1:
+                                await asyncio.sleep(0.8)
+                    else:
+                        # [SILENT] — still notify channel to cancel typing indicator
+                        await self.bus.publish_outbound(OutboundMessage(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            content="",
+                            metadata={"_silent": True},
+                        ))
                 except Exception as e:
                     logger.error(f"Error processing message: {e}")
                     await self.bus.publish_outbound(OutboundMessage(
@@ -449,6 +614,35 @@ class AgentLoop:
         self._running = False
         logger.info("Agent loop stopping")
 
+    async def shutdown(self) -> None:
+        """Async shutdown — stops MCP servers and other async resources."""
+        self.stop()
+        if self._mcp_manager:
+            try:
+                await self._mcp_manager.stop()
+            except Exception as e:
+                logger.error(f"MCP Manager shutdown error: {e}")
+
+    # ── Startup diary catch-up ────────────────────────────────
+
+    async def _maybe_write_diary(self) -> None:
+        """Check if yesterday's diary is missing and write it on startup."""
+        from datetime import timedelta
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        diary_path = self.workspace / "memory" / "diary" / f"{yesterday}.md"
+        if diary_path.exists():
+            return
+
+        logger.info(f"Diary catch-up: {yesterday}.md missing, triggering write")
+        try:
+            await self.process_direct(
+                diary_catchup_prompt(yesterday),
+                session_key="cron:diary-catchup",
+            )
+            logger.info(f"Diary catch-up: {yesterday} done")
+        except Exception as e:
+            logger.warning(f"Diary catch-up failed: {e}")
+
     # ── Startup greeting ───────────────────────────────────────
 
     async def _startup_greet(self) -> None:
@@ -459,6 +653,9 @@ class AgentLoop:
         for each. The LLM decides whether the current time is appropriate —
         no hardcoded time windows.
         """
+        # Catch up on missed diary before greeting
+        await self._maybe_write_diary()
+
         now_mono = time.monotonic()
         restored = []
 
@@ -471,6 +668,10 @@ class AgentLoop:
             if len(parts) != 2:
                 continue
             channel, chat_id = parts
+            # Skip channels that are not currently enabled
+            if self._enabled_channels is not None and channel not in self._enabled_channels:
+                logger.debug(f"Startup greet: skipping disabled channel {channel}:{chat_id}")
+                continue
             chat_key = (channel, chat_id)
             self._active_chats.add(chat_key)
             self._last_user_msg_at[chat_key] = now_mono
@@ -507,7 +708,7 @@ class AgentLoop:
                     temperature=0.9,
                     max_tokens=256,
                 )
-                reply = (response.content or "").strip()
+                reply = _strip_ts_prefix((response.content or "").strip())
             except Exception as e:
                 logger.warning(f"Startup greeting failed for {session_key}: {e}")
                 continue
@@ -559,6 +760,11 @@ class AgentLoop:
                 continue
 
             channel, chat_id = chat_key
+
+            # Skip channels that are not currently enabled (avoid wasting LLM calls)
+            if self._enabled_channels is not None and channel not in self._enabled_channels:
+                continue
+
             silent_seconds = now - last_msg_at
             silent_minutes = int(silent_seconds / 60)
 
@@ -597,7 +803,7 @@ class AgentLoop:
                     temperature=0.9,  # Slightly more creative for casual chat
                     max_tokens=256,
                 )
-                reply = (response.content or "").strip()
+                reply = _strip_ts_prefix((response.content or "").strip())
             except Exception as e:
                 logger.warning(f"Follow-up LLM call failed for {session_key}: {e}")
                 self._next_followup_at[chat_key] = now + random.uniform(600, 1800)
@@ -741,10 +947,13 @@ class AgentLoop:
             chat_id=msg.chat_id,
             override_system_prompt=system_prompt,
         )
-        final_content, tools_used = await self._run_agent_loop(initial_messages)
+        final_content, tools_used, reasoning = await self._run_agent_loop(initial_messages)
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
+
+        # Strip timestamp prefixes the LLM may have mimicked from history
+        final_content = _strip_ts_prefix(final_content)
 
         # [SILENT] — Zero chose not to reply (e.g. user hasn't finished typing).
         # Record in session history so she has context, but send nothing.
@@ -753,7 +962,8 @@ class AgentLoop:
         session.add_message("user", msg.content)
         if not is_silent:
             session.add_message("assistant", final_content,
-                                tools_used=tools_used if tools_used else None)
+                                tools_used=tools_used if tools_used else None,
+                                reasoning_content=reasoning)
         self.sessions.save(session)
 
         if is_silent:
@@ -766,7 +976,8 @@ class AgentLoop:
 
         # Archive outbound response
         _archive_message("out", msg.channel, msg.chat_id, final_content,
-                         tools_used=tools_used if tools_used else None)
+                         tools_used=tools_used if tools_used else None,
+                         reasoning_content=reasoning)
 
         return OutboundMessage(
             channel=msg.channel,
@@ -803,7 +1014,7 @@ class AgentLoop:
             channel=origin_channel,
             chat_id=origin_chat_id,
         )
-        final_content, _ = await self._run_agent_loop(initial_messages)
+        final_content, _, _ = await self._run_agent_loop(initial_messages)
 
         if final_content is None:
             final_content = "Background task completed."

@@ -143,14 +143,28 @@ def _markdown_to_notion_blocks(content: str) -> list[dict[str, Any]]:
     return blocks
 
 
+CONTENT_TYPES = [
+    "Worker Report",
+    "Grading Output",
+    "Archive",
+    "Note",
+    "Meeting",
+]
+
+
 async def create_notion_page(
     api_token: str,
     database_id: str,
     title: str,
     content: str,
     tags: list[str] | None = None,
+    content_type: str | None = None,
 ) -> str | None:
     """Create a page in a Notion database.
+
+    Args:
+        content_type: One of CONTENT_TYPES. Sets the "Type" select property
+                      so the database can be filtered by content category.
 
     Returns:
         Page URL on success, None on failure.
@@ -173,6 +187,10 @@ async def create_notion_page(
             properties["Tags"] = {
                 "multi_select": [{"name": tag} for tag in tags],
             }
+        if content_type:
+            properties["Type"] = {
+                "select": {"name": content_type},
+            }
 
         blocks = _markdown_to_notion_blocks(content)
         payload: dict[str, Any] = {
@@ -191,10 +209,11 @@ async def create_notion_page(
             if response.status_code >= 400:
                 error_data = response.json()
                 msg = error_data.get("message", str(error_data))
-                # If Tags property doesn't exist, retry without it
-                if "is not a property that exists" in msg and "Tags" in properties:
-                    logger.warning(f"Notion database has no Tags property, retrying without tags")
-                    del properties["Tags"]
+                # If Tags/Type property doesn't exist, retry without them
+                if "is not a property that exists" in msg and ("Tags" in properties or "Type" in properties):
+                    logger.warning(f"Notion database missing property, retrying without Tags/Type")
+                    properties.pop("Tags", None)
+                    properties.pop("Type", None)
                     payload["properties"] = properties
                     response = await client.post(
                         "https://api.notion.com/v1/pages",
@@ -253,7 +272,8 @@ class SaveToNotionTool(Tool):
         return (
             "Save a document to Notion. Creates a new page in the configured Notion database. "
             "Content should be professional, third-person, without emoji or conversation artifacts. "
-            "Use this for key archival documents that need structured storage."
+            "Use this for key archival documents that need structured storage. "
+            "Always set content_type to categorize the page (Worker Report / Grading Output / Archive / Note / Meeting)."
         )
 
     @property
@@ -274,6 +294,11 @@ class SaveToNotionTool(Tool):
                     "items": {"type": "string"},
                     "description": "Optional tags for categorization",
                 },
+                "content_type": {
+                    "type": "string",
+                    "enum": CONTENT_TYPES,
+                    "description": "Page category — sets the Type property for filtered views",
+                },
             },
             "required": ["title", "content"],
         }
@@ -283,6 +308,7 @@ class SaveToNotionTool(Tool):
         title: str,
         content: str,
         tags: list[str] | None = None,
+        content_type: str | None = None,
         **kwargs: Any,
     ) -> str:
         if not self._api_token:
@@ -296,6 +322,7 @@ class SaveToNotionTool(Tool):
             title=title,
             content=content,
             tags=tags,
+            content_type=content_type,
         )
         if url:
             return f"Saved to Notion: {url}"

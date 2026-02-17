@@ -251,6 +251,7 @@ class WorkerDispatchTool(Tool):
                 title=f"Worker Report {record.task_id}",
                 content=md,
                 tags=["worker-report", record.status],
+                content_type="Worker Report",
             )
             # The notion tool returns "Saved to Notion: <url> (page_id: ...)"
             if "notion.so" in result or "notion.site" in result:

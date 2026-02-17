@@ -211,6 +211,21 @@ def startup_greeting_context(last_message_ts: str = "") -> str:
     )
 
 
+def diary_catchup_prompt(missed_date: str) -> str:
+    """Build a prompt for writing a missed diary entry on startup.
+
+    Args:
+        missed_date: The date string (YYYY-MM-DD) that was missed.
+    """
+    return (
+        f"[System: 日记补写] 你发现 {missed_date} 的日记还没写（可能昨晚关机了）。"
+        "读取 skills/diary/SKILL.md 了解格式，然后回顾那天的对话和工作，"
+        f"补写一篇日记到 memory/diary/{missed_date}.md。"
+        "写完后如果有重要的事需要长期记住，更新 MEMORY.md。"
+        "最后在 HISTORY.md 末尾追加一行摘要。不需要通知 Cai。"
+    )
+
+
 def followup_nudge_context(silent_minutes: int, task_summary: str = "") -> str:
     """Build a system hint asking the LLM whether to proactively follow up.
 
