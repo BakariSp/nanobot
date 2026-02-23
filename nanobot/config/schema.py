@@ -18,6 +18,7 @@ class TelegramConfig(BaseModel):
     enabled: bool = False
     token: str = ""  # Bot token from @BotFather
     allow_from: list[str] = Field(default_factory=list)  # Allowed user IDs or usernames
+    max_users: int = 0  # Max unique users allowed (0 = unlimited). First N users are admitted, rest rejected.
     proxy: str | None = None  # HTTP/SOCKS5 proxy URL, e.g. "http://127.0.0.1:7890" or "socks5://127.0.0.1:1080"
     notify_chat_ids: list[str] = Field(default_factory=list)  # Chat IDs for doctor crash alerts (fallback: allow_from)
 
@@ -204,6 +205,8 @@ class GatewayConfig(BaseModel):
 class WebSearchConfig(BaseModel):
     """Web search tool configuration."""
     api_key: str = ""  # Brave Search API key
+    google_cse_api_key: str = ""  # Google Custom Search JSON API key (fallback)
+    google_cse_cx: str = ""  # Google Custom Search engine ID (fallback)
     max_results: int = 5
 
 
@@ -236,7 +239,17 @@ class TTSToolConfig(BaseModel):
     dashscope_api_key: str = ""  # Falls back to providers.dashscope.api_key
     volcengine_app_id: str = ""
     volcengine_token: str = ""
+    volcengine_resource_id: str = "seed-tts-2.0"  # V3 API resource: seed-tts-1.0 / seed-tts-2.0
     default_voice: str = ""
+
+
+class OSSConfig(BaseModel):
+    """Aliyun OSS configuration for media uploads."""
+    endpoint: str = "oss-cn-hongkong.aliyuncs.com"
+    bucket: str = ""
+    access_key_id: str = ""
+    access_key_secret: str = ""
+    prefix: str = "nanobot/media"  # Object key prefix in bucket
 
 
 class ToolsConfig(BaseModel):
@@ -246,12 +259,23 @@ class ToolsConfig(BaseModel):
     notion: NotionConfig = Field(default_factory=NotionConfig)
     image_gen: ImageGenConfig = Field(default_factory=ImageGenConfig)
     tts: TTSToolConfig = Field(default_factory=TTSToolConfig)
+    oss: OSSConfig = Field(default_factory=OSSConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
 
 
 # ── MCP integration ──────────────────────────────────────────
 
 from nanobot.mcp.types import MCPConfig  # noqa: E402
+
+
+class KevinConfig(BaseModel):
+    """Kevin — autonomous crypto trading agent (Bybit)."""
+    enabled: bool = False
+    bybit_api_key: str = ""
+    bybit_api_secret: str = ""
+    bybit_testnet: bool = False
+    initial_balance: float = 0.0  # Starting USDT (for P&L tracking)
+    daily_cost: float = 0.5  # USDT burned per day (accrues whether awake or not)
 
 
 class DoctorConfig(BaseModel):
@@ -273,6 +297,7 @@ class Config(BaseSettings):
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     mcp: MCPConfig = Field(default_factory=MCPConfig)
     doctor: DoctorConfig = Field(default_factory=DoctorConfig)
+    kevin: KevinConfig = Field(default_factory=KevinConfig)
     
     @property
     def workspace_path(self) -> Path:

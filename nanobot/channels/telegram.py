@@ -100,11 +100,11 @@ class TelegramChannel(BaseChannel):
         self,
         config: TelegramConfig,
         bus: MessageBus,
-        groq_api_key: str = "",
+        dashscope_api_key: str = "",
     ):
         super().__init__(config, bus)
         self.config: TelegramConfig = config
-        self.groq_api_key = groq_api_key
+        self.dashscope_api_key = dashscope_api_key
         self._app: Application | None = None
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
@@ -197,8 +197,14 @@ class TelegramChannel(BaseChannel):
         # Stop typing indicator for this chat
         self._stop_typing(msg.chat_id)
 
-        # Silent message — only needed to cancel the typing indicator
+        # Silent message — send a visible indicator so the user knows we're alive
         if msg.metadata.get("_silent"):
+            try:
+                await self._app.bot.send_message(
+                    chat_id=int(msg.chat_id), text="[silent]",
+                )
+            except Exception as e:
+                logger.debug(f"Failed to send silent indicator: {e}")
             return
 
         try:
@@ -270,11 +276,15 @@ class TelegramChannel(BaseChannel):
         """Forward slash commands to the bus for unified handling in AgentLoop."""
         if not update.message or not update.effective_user:
             return
-        await self._handle_message(
+        rejection = await self._handle_message(
             sender_id=str(update.effective_user.id),
             chat_id=str(update.message.chat_id),
             content=update.message.text,
         )
+        if rejection == "user_cap_reached":
+            await update.message.reply_text(
+                "🙏 抱歉，目前处于内测阶段，测试名额已满，请稍后再试！"
+            )
     
     async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming messages (text, photos, voice, documents)."""
@@ -325,30 +335,34 @@ class TelegramChannel(BaseChannel):
             try:
                 file = await self._app.bot.get_file(media_file.file_id)
                 ext = self._get_extension(media_type, getattr(media_file, 'mime_type', None))
-                
-                # Save to workspace/media/
+
+                # Save to local disk first
                 from pathlib import Path
                 media_dir = Path.home() / ".nanobot" / "media"
                 media_dir.mkdir(parents=True, exist_ok=True)
-                
+
                 file_path = media_dir / f"{media_file.file_id[:16]}{ext}"
                 await file.download_to_drive(str(file_path))
-                
-                media_paths.append(str(file_path))
-                
+
                 # Handle voice transcription
                 if media_type == "voice" or media_type == "audio":
-                    from nanobot.providers.transcription import GroqTranscriptionProvider
-                    transcriber = GroqTranscriptionProvider(api_key=self.groq_api_key)
+                    from nanobot.providers.transcription import DashScopeTranscriptionProvider
+                    transcriber = DashScopeTranscriptionProvider(api_key=self.dashscope_api_key)
                     transcription = await transcriber.transcribe(file_path)
                     if transcription:
                         logger.info(f"Transcribed {media_type}: {transcription[:50]}...")
                         content_parts.append(f"[transcription: {transcription}]")
                     else:
                         content_parts.append(f"[{media_type}: {file_path}]")
+                    media_paths.append(str(file_path))
                 else:
-                    content_parts.append(f"[{media_type}: {file_path}]")
-                    
+                    # For images: upload to OSS for a public URL, fall back to local path
+                    from nanobot.providers.oss import upload_to_oss
+                    oss_url = await upload_to_oss(file_path)
+                    media_ref = oss_url or str(file_path)
+                    media_paths.append(media_ref)
+                    content_parts.append(f"[{media_type}: {media_ref}]")
+
                 logger.debug(f"Downloaded {media_type} to {file_path}")
             except Exception as e:
                 logger.error(f"Failed to download media: {e}")
@@ -364,7 +378,7 @@ class TelegramChannel(BaseChannel):
         self._start_typing(str_chat_id)
         
         # Forward to the message bus
-        await self._handle_message(
+        rejection = await self._handle_message(
             sender_id=sender_id,
             chat_id=str_chat_id,
             content=content,
@@ -377,6 +391,11 @@ class TelegramChannel(BaseChannel):
                 "is_group": message.chat.type != "private"
             }
         )
+        if rejection == "user_cap_reached":
+            self._stop_typing(str_chat_id)
+            await message.reply_text(
+                "🙏 抱歉，目前处于内测阶段，测试名额已满，请稍后再试！"
+            )
     
     def _start_typing(self, chat_id: str) -> None:
         """Start sending 'typing...' indicator for a chat."""
