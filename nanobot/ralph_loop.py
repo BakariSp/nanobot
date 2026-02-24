@@ -47,8 +47,12 @@ def _detect_auth_failure(output: str) -> bool:
     return bool(_AUTH_KEYWORDS.search(output))
 
 
-def _parse_worker_report(output: str) -> dict:
-    """Extract JSON report block from worker stdout."""
+def _parse_worker_tail(output: str) -> dict:
+    """Extract the small machine-readable JSON tail from worker output.
+
+    Best-effort: returns empty dict fields on parse failure — the caller
+    uses exit code as the primary success/failure signal.
+    """
     cleaned = re.sub(r'```(?:json)?\s*\n?', '', output)
     for i in range(len(cleaned) - 1, -1, -1):
         if cleaned[i] == '}':
@@ -66,12 +70,36 @@ def _parse_worker_report(output: str) -> dict:
                     except json.JSONDecodeError:
                         break
                     break
-    return {
-        "status": "unknown",
-        "summary": "Could not parse worker report",
-        "files_changed": [],
-        "checks": {},
-    }
+    return {"status": "", "files_changed": []}
+
+
+def _extract_summary(raw: str, max_chars: int = 300) -> str:
+    """Extract a human-readable summary from raw worker output.
+
+    Strategy: find the last markdown heading and take content after it,
+    or fall back to the last N characters.
+    """
+    lines = raw.rstrip().split("\n")
+    # Find last heading
+    last_heading_idx = -1
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].startswith("## ") or lines[i].startswith("# "):
+            last_heading_idx = i
+            break
+    if last_heading_idx >= 0:
+        section = "\n".join(lines[last_heading_idx:]).strip()
+        # Remove the JSON tail if present
+        json_start = section.rfind('{"status"')
+        if json_start > 0:
+            section = section[:json_start].strip()
+        if section:
+            return section[:max_chars]
+    # Fallback: last N chars, stripping JSON tail
+    tail = raw[-max_chars * 2:] if len(raw) > max_chars * 2 else raw
+    json_start = tail.rfind('{"status"')
+    if json_start > 0:
+        tail = tail[:json_start]
+    return tail.strip()[-max_chars:]
 
 
 # ── Heartbeat ─────────────────────────────────────────────────────
@@ -218,21 +246,18 @@ Read these files first for project context: {', '.join(context_files)}
 - Do NOT create new documentation files unless asked
 - Run relevant checks (lint, build, test) when you make code changes
 
-## Required Output
-After completing the task, output EXACTLY one JSON block as your FINAL message:
+## Output Guidelines
+- Write your findings naturally: what you discovered, which files you changed, why you made those decisions, and anything that needs attention.
+- Use headings, bullet points, code snippets — whatever makes the report clear.
+- Include file paths for every change.
+- This natural-language report is the primary deliverable — make it thorough.
+
+## Machine-Readable Tail (REQUIRED)
+As your VERY LAST output, append exactly this small JSON block:
 ```json
-{{
-  "status": "done|failed|blocked",
-  "summary": "1-2 sentence summary",
-  "files_changed": ["file1", "file2"],
-  "checks": {{
-    "lint": "pass|fail|skipped",
-    "typecheck": "pass|fail|skipped",
-    "build": "pass|fail|skipped",
-    "test": "pass|fail|skipped"
-  }}
-}}
-```"""
+{{"status": "done|failed|blocked", "files_changed": ["path1", "path2"]}}
+```
+Keep it minimal. Your natural-language report above is what matters."""
 
 
 async def execute_worker(
@@ -264,7 +289,7 @@ async def execute_worker(
 
     cmd = [
         cli, "-p", prompt,
-        "--output-format", "stream-json",
+        "--output-format", "text",
         "--permission-mode", "bypassPermissions",
         "--allowedTools", "Bash Edit Read Write Glob Grep",
         "--model", run.model,
@@ -314,13 +339,23 @@ async def execute_worker(
             run.failure_diagnosis = "auth_expired"
             return run
 
-        # Parse worker output
-        report = _parse_worker_report(raw)
-        worker_status = report.get("status", "unknown")
-        run.status = "success" if worker_status == "done" else "failed"
-        run.summary = report.get("summary", "")
-        run.files_changed = report.get("files_changed", [])
-        run.checks = report.get("checks", {})
+        # Primary: exit code determines success/failure
+        if proc.returncode == 0:
+            run.status = "success"
+        else:
+            run.status = "failed"
+
+        # Secondary: parse tail JSON for files_changed (best-effort)
+        tail = _parse_worker_tail(raw)
+        run.files_changed = tail.get("files_changed", [])
+
+        # Override: if exit 0 but worker explicitly says failed/blocked, trust it
+        tail_status = tail.get("status", "")
+        if run.status == "success" and tail_status in ("failed", "blocked"):
+            run.status = "failed"
+
+        # Extract summary from natural-language output
+        run.summary = _extract_summary(raw)
 
         if run.status == "failed" and not run.failure_diagnosis:
             run.failure_diagnosis = "worker_error"
@@ -376,8 +411,34 @@ _notion_api_token: str | None = None
 _notion_database_id: str | None = None
 
 
-async def _sync_run_to_notion(run: WorkerRunRecord) -> str | None:
-    """Save a completed worker run to Notion with Type=Worker Report.
+def _clean_raw_for_notion(raw: str, max_chars: int = 8000) -> str:
+    """Clean raw worker output for Notion: strip verbose tool-use noise, keep findings."""
+    lines = raw.split("\n")
+    kept: list[str] = []
+    total = 0
+    for line in lines:
+        # Skip verbose Claude CLI internal lines
+        if any(line.startswith(p) for p in ("[tool_use]", "[tool_result]", "[thinking]", "⏺ ")):
+            continue
+        kept.append(line)
+        total += len(line) + 1
+        if total > max_chars:
+            kept.append("... (truncated, see raw log for full output)")
+            break
+    return "\n".join(kept)
+
+
+async def _sync_run_to_notion(
+    run: WorkerRunRecord,
+    task: TaskDefinition,
+    ledger: DualLedger,
+) -> str | None:
+    """Save/update a worker run to Notion with the full report body.
+
+    - First run for a task → creates a new Notion page.
+    - Subsequent retries → appends a new section to the existing page.
+
+    Stores notion_page_id/url back on the WorkerRunRecord.
 
     Returns:
         Page URL on success, None on failure or if Notion is not configured.
@@ -390,48 +451,134 @@ async def _sync_run_to_notion(run: WorkerRunRecord) -> str | None:
         return None
 
     try:
-        from nanobot.agent.tools.notion_save import create_notion_page
+        from nanobot.agent.tools.notion_save import (
+            append_notion_blocks,
+            create_notion_page,
+        )
 
-        # Build a concise markdown report
-        lines = [
-            f"# Worker Report: {run.run_id}",
+        # Read raw log for report body
+        raw = get_raw_output(run.run_id) or "(raw log not available)"
+        cleaned_body = _clean_raw_for_notion(raw)
+
+        # Build report content
+        meta_lines = [
+            f"## Run: {run.run_id}",
             "",
             f"| Field | Value |",
             f"|---|---|",
-            f"| **Run ID** | {run.run_id} |",
-            f"| **Task ID** | {run.task_id} |",
             f"| **Status** | {run.status} |",
             f"| **Model** | {run.model} |",
             f"| **Duration** | {run.duration_s}s |",
             f"| **Exit Code** | {run.exit_code} |",
             "",
-            "## Summary",
-            run.summary or "(no summary)",
+            "## Goal",
+            task.goal[:500],
+            "",
+            "## Report",
+            cleaned_body,
         ]
         if run.files_changed:
-            lines += ["", "## Files Changed"]
+            meta_lines += ["", "## Files Changed"]
             for f in run.files_changed:
-                lines.append(f"- `{f}`")
-        if run.checks:
-            lines += ["", "## Quality Checks", "| Check | Result |", "|---|---|"]
-            for k, v in run.checks.items():
-                lines.append(f"| {k} | {v} |")
+                meta_lines.append(f"- `{f}`")
+        raw_log_path = str(RAW_OUTPUT_DIR / f"{run.run_id}.raw.log")
+        meta_lines += ["", f"**Raw log:** `{raw_log_path}`"]
 
-        content = "\n".join(lines)
-        url = await create_notion_page(
-            api_token=_notion_api_token,
-            database_id=_notion_database_id,
-            title=f"Worker Report {run.run_id}",
-            content=content,
-            tags=["worker-report", run.status],
-            content_type="Worker Report",
-        )
-        if url:
-            logger.info(f"Notion sync OK for {run.run_id}: {url}")
-        return url
+        content = "\n".join(meta_lines)
+
+        # Check if task already has a Notion page from a previous run
+        previous_page_id = None
+        for prev_run_id in task.worker_runs:
+            if prev_run_id == run.run_id:
+                continue
+            prev_run = ledger.get_run(prev_run_id)
+            if prev_run and prev_run.notion_page_id:
+                previous_page_id = prev_run.notion_page_id
+                break
+
+        if previous_page_id:
+            # Append to existing page
+            separator = f"\n---\n\n# Retry: {run.run_id}\n\n"
+            ok = await append_notion_blocks(
+                api_token=_notion_api_token,
+                page_id=previous_page_id,
+                content=separator + content,
+            )
+            if ok:
+                run.notion_page_id = previous_page_id
+                # Reuse the URL from the previous run
+                for prev_run_id in task.worker_runs:
+                    prev_run = ledger.get_run(prev_run_id)
+                    if prev_run and prev_run.notion_page_url:
+                        run.notion_page_url = prev_run.notion_page_url
+                        break
+                ledger.save_run(run)
+                logger.info(f"Notion appended {run.run_id} to existing page {previous_page_id}")
+                return run.notion_page_url
+            return None
+        else:
+            # Create new page with full report
+            title_content = f"# Worker Report: {task.task_id}\n\n" + content
+            url = await create_notion_page(
+                api_token=_notion_api_token,
+                database_id=_notion_database_id,
+                title=f"Worker Report {task.task_id}",
+                content=title_content,
+                tags=["worker-report", run.status],
+                content_type="Worker Report",
+            )
+            if url:
+                # Extract page_id from URL (notion.so pages have id in URL)
+                # URL format: https://www.notion.so/Title-<page_id_without_dashes>
+                import re as _re
+                page_id_match = _re.search(r'([0-9a-f]{32})$', url.replace('-', ''))
+                if page_id_match:
+                    raw_id = page_id_match.group(1)
+                    run.notion_page_id = f"{raw_id[:8]}-{raw_id[8:12]}-{raw_id[12:16]}-{raw_id[16:20]}-{raw_id[20:]}"
+                run.notion_page_url = url
+                ledger.save_run(run)
+                logger.info(f"Notion sync OK for {run.run_id}: {url}")
+            return url
     except Exception as e:
         logger.warning(f"Notion sync failed for {run.run_id}: {e}")
         return None
+
+
+async def _archive_stale_done_tasks(ledger: DualLedger) -> int:
+    """Archive tasks that have been 'done' for more than 24 hours.
+
+    Updates Notion page status to Archived and marks task as archived in ledger.
+    Returns the number of tasks archived.
+    """
+    global _notion_api_token, _notion_database_id
+    if _notion_api_token is None:
+        _notion_api_token, _notion_database_id = _load_notion_config()
+
+    stale = ledger.list_tasks(status="done", older_than_hours=24)
+    archived = 0
+    for task in stale:
+        # Try to archive in Notion
+        if _notion_api_token:
+            # Find notion page_id from any run
+            for run_id in task.worker_runs:
+                run = ledger.get_run(run_id)
+                if run and run.notion_page_id:
+                    try:
+                        from nanobot.agent.tools.notion_save import update_notion_page_property
+                        await update_notion_page_property(
+                            api_token=_notion_api_token,
+                            page_id=run.notion_page_id,
+                            properties={
+                                "Tags": {"multi_select": [{"name": "archived"}]},
+                            },
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to archive Notion page for {task.task_id}: {e}")
+                    break
+        ledger.update_task_status(task.task_id, "archived")
+        archived += 1
+        logger.info(f"Archived stale done task {task.task_id}")
+    return archived
 
 
 # ── Main Loop ─────────────────────────────────────────────────────
@@ -512,15 +659,21 @@ async def ralph_loop() -> None:
                     ledger.update_task_status(task.task_id, "blocked")
                     logger.warning(f"{task.task_id} failed {retry_count} times, marking blocked")
 
-            # Sync to Notion
-            await _sync_run_to_notion(run)
+            # Sync to Notion (pass task + ledger for retry-update logic)
+            await _sync_run_to_notion(run, task, ledger)
 
-            # Notify 零号
+            # Notify 零号 with enriched context
+            raw_log_path = str(RAW_OUTPUT_DIR / f"{run.run_id}.raw.log")
             ledger.append_notification(
                 task_id=task.task_id,
                 run_id=run.run_id,
                 status=run.status,
                 summary=run.summary[:200],
+                goal=task.goal[:200],
+                raw_log_path=raw_log_path,
+                duration_s=run.duration_s,
+                failure_diagnosis=run.failure_diagnosis or "",
+                notion_page_url=getattr(run, "notion_page_url", "") or "",
             )
 
             # Write lesson learned on failure
@@ -536,6 +689,14 @@ async def ralph_loop() -> None:
                     logger.warning(f"Could not write to PROGRESS.md: {e}")
 
             logger.info(f"{task.task_id}/{run.run_id}: {run.status} ({run.duration_s}s)")
+
+            # Periodically archive stale done tasks
+            try:
+                archived = await _archive_stale_done_tasks(ledger)
+                if archived:
+                    logger.info(f"Archived {archived} stale done task(s)")
+            except Exception as e:
+                logger.warning(f"Archive sweep failed: {e}")
 
     finally:
         heartbeat.release()
