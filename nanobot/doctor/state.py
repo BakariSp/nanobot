@@ -44,6 +44,7 @@ def _default_state() -> dict[str, Any]:
         "last_crash_ts": None,
         "consecutive_crash_loops": 0,
         "rollback_history": [],
+        "last_plugin_edit": None,  # {ts, file, snapshot_path, reason} — set by plugin_edit tool
     }
 
 

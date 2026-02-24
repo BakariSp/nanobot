@@ -113,14 +113,15 @@ def _log_usage(task: str, model: str, duration_s: float, status: str, exit_code:
 
 
 class WorkerDispatchTool(Tool):
-    """Dispatch a coding task — non-blocking queue mode (default) or legacy sync.
+    """Dispatch a coding task to a worker.
 
-    New mode (queue):
-        Writes a T-xxx TaskDefinition to DualLedger with risk classification.
-        Returns immediately. Ralph Loop picks up and executes asynchronously.
-
-    Legacy mode:
-        Runs Claude Code CLI synchronously. Used when dual_ledger is None.
+    Three execution modes:
+    - conversational (default): Internal agent with bi-directional communication.
+      Worker can ask questions via request_input, Zero replies via worker_reply.
+      Runs in nanobot's process, shares LLM provider. Best for most tasks.
+    - background: Queue to Ralph Loop → Claude Code CLI. One-shot, no interaction.
+      Best for very long-running tasks or when Claude Code CLI tools are needed.
+    - legacy: Synchronous execution via CLI. Used when dual_ledger is None.
     """
 
     def __init__(
@@ -129,12 +130,21 @@ class WorkerDispatchTool(Tool):
         ledger: TaskLedger | None = None,
         dual_ledger: DualLedger | None = None,
         notion_tool: Any | None = None,
+        subagent_manager: Any | None = None,
     ):
         self.default_cwd = default_cwd
         self._ledger = ledger
         self._dual_ledger = dual_ledger
         self._notion_tool = notion_tool
+        self._subagent_manager = subagent_manager
         self._progress_callback: Callable[[str, dict], Awaitable[None]] | None = None
+        # Stored for conversational workers to know which chat to notify
+        self._last_origin_channel: str = "cli"
+        self._last_origin_chat_id: str = "direct"
+
+    def set_subagent_manager(self, manager: Any) -> None:
+        """Wire up SubagentManager after registration."""
+        self._subagent_manager = manager
 
     def set_notion_tool(self, tool: Any) -> None:
         """Wire up the Notion tool after registration."""
@@ -153,10 +163,10 @@ class WorkerDispatchTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Queue a coding task for async execution by the Ralph Loop. "
-            "Returns immediately with task ID, risk level, and queue status. "
-            "L1-L2 tasks auto-execute. L3 tasks need /approve. "
-            "Use for code changes, scans, fixes, features."
+            "Dispatch a coding task to a worker. Returns immediately with task ID. "
+            "Default mode is 'conversational' — worker can ask you questions via request_input. "
+            "Use 'background' mode for very long tasks (runs via Ralph Loop / Claude Code CLI). "
+            "L1-L2 tasks auto-execute. L3 tasks need /approve."
         )
 
     @property
@@ -167,6 +177,14 @@ class WorkerDispatchTool(Tool):
                 "task": {
                     "type": "string",
                     "description": "Detailed task description for the worker"
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["conversational", "background"],
+                    "description": (
+                        "Execution mode. 'conversational' (default): worker can ask questions, "
+                        "reports back directly. 'background': fire-and-forget via Ralph Loop."
+                    ),
                 },
                 "task_type": {
                     "type": "string",
@@ -183,7 +201,7 @@ class WorkerDispatchTool(Tool):
                 },
                 "model": {
                     "type": "string",
-                    "description": "Worker model. Default: opus"
+                    "description": "Worker model (fully qualified, e.g. 'anthropic/claude-opus-4-5'). Default: same as Zero's model."
                 },
                 "cwd": {
                     "type": "string",
@@ -265,19 +283,36 @@ class WorkerDispatchTool(Tool):
 
     # ── Main execute ──────────────────────────────────────────────
 
+    def set_origin(self, channel: str, chat_id: str) -> None:
+        """Set the origin channel/chat for worker notifications."""
+        self._last_origin_channel = channel
+        self._last_origin_chat_id = chat_id
+
     async def execute(
         self,
         task: str,
+        mode: str = "conversational",
         task_type: str = "fix",
         scope_allow: str = "",
         scope_deny: str = "",
-        model: str = "opus",
+        model: str = "",
         cwd: str = "",
         timeout: int = 3600,
         acceptance: str = "",
         **kwargs: Any,
     ) -> str:
-        # ── New: non-blocking queue mode ──────────────────────────
+        # ── Conversational mode: internal agent with bi-directional comms ──
+        if mode == "conversational" and self._dual_ledger and self._subagent_manager:
+            return await self._dispatch_conversational(
+                task=task,
+                task_type=task_type,
+                scope_allow=scope_allow,
+                scope_deny=scope_deny,
+                model=model,
+                acceptance=acceptance,
+            )
+
+        # ── Background mode: queue for Ralph Loop ──────────────────
         if self._dual_ledger:
             return self._queue_task(
                 task=task,
@@ -288,6 +323,8 @@ class WorkerDispatchTool(Tool):
             )
 
         # ── Legacy: synchronous execution ─────────────────────────
+        # Legacy mode uses Claude Code CLI — default to "opus" if no model specified
+        model = model or "opus"
         # Generate task ID
         task_id = self._ledger.next_id() if self._ledger else ""
         ts_start = datetime.now(timezone.utc).isoformat()
@@ -452,7 +489,116 @@ After completing the task, output EXACTLY one JSON block as your FINAL message:
                 "duration_s": round(duration, 1),
             }, indent=2)
 
-    # ── Non-blocking queue ─────────────────────────────────────────
+    # ── Conversational worker (internal agent) ────────────────────
+
+    async def _dispatch_conversational(
+        self,
+        task: str,
+        task_type: str,
+        scope_allow: str,
+        scope_deny: str,
+        model: str,
+        acceptance: str,
+    ) -> str:
+        """Dispatch a conversational worker via SubagentManager.
+
+        Creates T-xxx and W-xxx in DualLedger, then spawns an internal
+        worker agent that can ask questions back to Zero.
+        """
+        dl = self._dual_ledger
+        mgr = self._subagent_manager
+        assert dl is not None and mgr is not None
+
+        # ── Dedup: skip if an existing task with the same goal is still active ──
+        active_statuses = ("todo", "doing", "waiting_for_input", "pending_approval")
+        for existing in dl.list_tasks():
+            if existing.status in active_statuses and existing.goal.strip() == task.strip():
+                logger.info(
+                    f"Dedup: task with same goal already active as {existing.task_id} "
+                    f"({existing.status}). Skipping duplicate dispatch."
+                )
+                return json.dumps({
+                    "task_id": existing.task_id,
+                    "status": existing.status,
+                    "mode": "conversational",
+                    "message": (
+                        f"Task {existing.task_id} already exists with the same goal "
+                        f"(status: {existing.status}). Not dispatching a duplicate."
+                    ),
+                }, indent=2)
+
+        # Resolve model — empty/bare alias → use parent model (SubagentManager's model)
+        if not model:
+            model = mgr.model
+
+        allow_list = [s.strip() for s in scope_allow.split(",") if s.strip()] if scope_allow else []
+        deny_list = [s.strip() for s in scope_deny.split(",") if s.strip()] if scope_deny else []
+
+        risk = classify_risk(task_type, task, allow_list)
+
+        task_id = dl.next_task_id()
+        status = "pending_approval" if risk == "L3" else "doing"
+
+        acceptance_checks = []
+        if acceptance:
+            acceptance_checks.append({"type": "command", "value": acceptance})
+
+        td = TaskDefinition(
+            task_id=task_id,
+            goal=task,
+            scope={"allow": allow_list, "deny": deny_list},
+            risk_level=risk,
+            task_type=task_type,
+            acceptance=acceptance_checks,
+            status=status,
+            created_by="zero",
+        )
+        dl.save_task(td)
+
+        if status == "pending_approval":
+            logger.info(f"L3 task {task_id} needs approval: {task[:80]}")
+            return json.dumps({
+                "task_id": task_id,
+                "risk_level": risk,
+                "status": status,
+                "mode": "conversational",
+                "message": f"Task {task_id} needs `/approve {task_id}` (L3)",
+            }, indent=2)
+
+        # Create worker run
+        run_id = dl.next_run_id()
+        from nanobot.agent.tools.task_ledger import WorkerRunRecord
+        run = WorkerRunRecord(
+            run_id=run_id,
+            task_id=task_id,
+            model=model,
+            cwd=self.default_cwd,
+            status="running",
+        )
+        dl.add_worker_run(task_id, run_id)
+        dl.save_run(run)
+
+        # Spawn conversational worker
+        result = await mgr.spawn_worker(
+            task=task,
+            task_id=task_id,
+            run_id=run_id,
+            origin_channel=self._last_origin_channel,
+            origin_chat_id=self._last_origin_chat_id,
+            model=model,
+        )
+
+        logger.info(f"Dispatched conversational worker {run_id} for {task_id}: {task[:80]}")
+        return json.dumps({
+            "task_id": task_id,
+            "run_id": run_id,
+            "risk_level": risk,
+            "status": "running",
+            "mode": "conversational",
+            "message": f"Worker {run_id} started for {task_id}. It can ask you questions if needed.",
+        }, indent=2)
+
+    # ── Non-blocking queue (background mode, Ralph Loop) ──────────
 
     def _queue_task(
         self,

@@ -73,8 +73,8 @@ def classify_risk(task_type: str, goal: str, scope_allow: list[str]) -> str:
 # New Dual-ID Schemas (T-xxx / W-xxx)
 # ═══════════════════════════════════════════════════════════════════
 
-TASK_STATUSES = ("draft", "todo", "pending_approval", "doing", "done", "blocked", "paused", "cancelled")
-RUN_STATUSES = ("created", "running", "success", "failed")
+TASK_STATUSES = ("draft", "todo", "pending_approval", "doing", "waiting_for_input", "done", "blocked", "paused", "cancelled", "archived")
+RUN_STATUSES = ("created", "running", "waiting_for_input", "success", "failed")
 TASK_TYPES = ("recon", "fix", "feature", "refactor", "plan", "verify")
 
 
@@ -113,6 +113,9 @@ class WorkerRunRecord:
     checks: dict[str, str] = field(default_factory=dict)
     failure_diagnosis: str | None = None
     lesson_learned: str | None = None
+    report_path: str = ""
+    notion_page_id: str | None = None
+    notion_page_url: str | None = None
     created_at: str = ""
 
 
@@ -195,12 +198,26 @@ class DualLedger:
             logger.warning(f"Failed to load {run_id}: {e}")
             return None
 
-    def list_tasks(self, status: str | None = None) -> list[TaskDefinition]:
+    def list_tasks(self, status: str | None = None, older_than_hours: float = 0) -> list[TaskDefinition]:
         tasks = []
+        cutoff = None
+        if older_than_hours > 0:
+            from datetime import timedelta
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=older_than_hours)
         for f in sorted(self.base_dir.glob("T-*.json")):
             task = self.get_task(f.stem)
-            if task and (status is None or task.status == status):
-                tasks.append(task)
+            if not task:
+                continue
+            if status is not None and task.status != status:
+                continue
+            if cutoff and task.updated_at:
+                try:
+                    updated = datetime.fromisoformat(task.updated_at)
+                    if updated > cutoff:
+                        continue
+                except ValueError:
+                    pass
+            tasks.append(task)
         return tasks
 
     def update_task_status(self, task_id: str, new_status: str) -> bool:
@@ -226,13 +243,29 @@ class DualLedger:
     def _notify_path(self) -> Path:
         return DATA_DIR / ".ralph_notifications.jsonl"
 
-    def append_notification(self, task_id: str, run_id: str, status: str, summary: str) -> None:
+    def append_notification(
+        self,
+        task_id: str,
+        run_id: str,
+        status: str,
+        summary: str,
+        goal: str = "",
+        raw_log_path: str = "",
+        duration_s: float = 0.0,
+        failure_diagnosis: str = "",
+        notion_page_url: str = "",
+    ) -> None:
         entry = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "task_id": task_id,
             "run_id": run_id,
             "status": status,
             "summary": summary,
+            "goal": goal,
+            "raw_log_path": raw_log_path,
+            "duration_s": duration_s,
+            "failure_diagnosis": failure_diagnosis,
+            "notion_page_url": notion_page_url,
         }
         with open(self._notify_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")

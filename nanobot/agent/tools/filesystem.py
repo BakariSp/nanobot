@@ -14,6 +14,19 @@ def _resolve_path(path: str, allowed_dir: Path | None = None) -> Path:
     return resolved
 
 
+def _check_core_ring(path: str) -> str | None:
+    """If path is a nanobot core-ring file, return an error message. Otherwise None."""
+    from nanobot.agent.tools.plugin_edit import is_nanobot_file, is_plugin_file
+    resolved = Path(path).expanduser().resolve()
+    if is_nanobot_file(resolved) and not is_plugin_file(resolved):
+        return (
+            f"Error: {resolved.name} is in nanobot's core ring and cannot be "
+            "self-modified. Use plugin_edit for plugin-ring files, or ask the "
+            "user to make core changes manually."
+        )
+    return None
+
+
 class ReadFileTool(Tool):
     """Tool to read file contents."""
     
@@ -59,18 +72,18 @@ class ReadFileTool(Tool):
 
 class WriteFileTool(Tool):
     """Tool to write content to a file."""
-    
+
     def __init__(self, allowed_dir: Path | None = None):
         self._allowed_dir = allowed_dir
 
     @property
     def name(self) -> str:
         return "write_file"
-    
+
     @property
     def description(self) -> str:
         return "Write content to a file at the given path. Creates parent directories if needed."
-    
+
     @property
     def parameters(self) -> dict[str, Any]:
         return {
@@ -87,9 +100,11 @@ class WriteFileTool(Tool):
             },
             "required": ["path", "content"]
         }
-    
+
     async def execute(self, path: str, content: str, **kwargs: Any) -> str:
         try:
+            if err := _check_core_ring(path):
+                return err
             file_path = _resolve_path(path, self._allowed_dir)
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(content, encoding="utf-8")
@@ -137,6 +152,8 @@ class EditFileTool(Tool):
     
     async def execute(self, path: str, old_text: str, new_text: str, **kwargs: Any) -> str:
         try:
+            if err := _check_core_ring(path):
+                return err
             file_path = _resolve_path(path, self._allowed_dir)
             if not file_path.exists():
                 return f"Error: File not found: {path}"

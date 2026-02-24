@@ -256,6 +256,77 @@ async def create_notion_page(
         return None
 
 
+async def append_notion_blocks(
+    api_token: str,
+    page_id: str,
+    content: str,
+) -> bool:
+    """Append markdown content as blocks to an existing Notion page.
+
+    Returns True on success, False on failure.
+    """
+    try:
+        import httpx
+
+        headers = {
+            "Authorization": f"Bearer {api_token}",
+            "Notion-Version": "2022-06-28",
+            "Content-Type": "application/json",
+        }
+        blocks = _markdown_to_notion_blocks(content)
+        remaining = blocks
+        async with httpx.AsyncClient() as client:
+            while remaining:
+                batch = remaining[:100]
+                remaining = remaining[100:]
+                resp = await client.patch(
+                    f"https://api.notion.com/v1/blocks/{page_id}/children",
+                    json={"children": batch},
+                    headers=headers,
+                    timeout=30.0,
+                )
+                if resp.status_code >= 400:
+                    logger.error(f"Notion append failed: {resp.text[:300]}")
+                    return False
+        return True
+    except Exception as e:
+        logger.error(f"Notion append error: {e}")
+        return False
+
+
+async def update_notion_page_property(
+    api_token: str,
+    page_id: str,
+    properties: dict[str, Any],
+) -> bool:
+    """Update properties on an existing Notion page (e.g. status, tags).
+
+    Returns True on success, False on failure.
+    """
+    try:
+        import httpx
+
+        headers = {
+            "Authorization": f"Bearer {api_token}",
+            "Notion-Version": "2022-06-28",
+            "Content-Type": "application/json",
+        }
+        async with httpx.AsyncClient() as client:
+            resp = await client.patch(
+                f"https://api.notion.com/v1/pages/{page_id}",
+                json={"properties": properties},
+                headers=headers,
+                timeout=30.0,
+            )
+            if resp.status_code >= 400:
+                logger.error(f"Notion property update failed: {resp.text[:300]}")
+                return False
+        return True
+    except Exception as e:
+        logger.error(f"Notion property update error: {e}")
+        return False
+
+
 class SaveToNotionTool(Tool):
     """Tool to save content to a Notion database as a new page."""
 

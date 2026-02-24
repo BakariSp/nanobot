@@ -75,7 +75,7 @@ class TaskTool(Tool):
         elif action == "update":
             return self._update(kwargs.get("status", ""))
         elif action == "complete":
-            return self._complete(kwargs.get("summary", ""))
+            return self._complete(kwargs.get("summary", ""), slug=kwargs.get("slug", ""))
         elif action == "list":
             return self._list()
         else:

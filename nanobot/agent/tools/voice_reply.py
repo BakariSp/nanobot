@@ -49,7 +49,8 @@ class VoiceReplyTool(Tool):
             "Use ONLY for short, casual replies (greetings, check-ins, encouragement). "
             "Do NOT use for task responses, code, lists, or anything longer than 2 sentences. "
             "IMPORTANT: content must be plain spoken text only. No parenthetical stage directions "
-            "like (笑), (停顿), (语音), (whisper) — TTS will read them out loud."
+            "like (笑), (停顿), (语音), (whisper) — TTS will read them out loud. "
+            "Choose voice and emotion to match the mood of your message."
         )
 
     @property
@@ -64,9 +65,29 @@ class VoiceReplyTool(Tool):
                 "voice": {
                     "type": "string",
                     "description": (
-                        "Voice ID: Cherry (sweet female, default), Ethan (warm male), "
-                        "Serena (gentle female), Moon (magnetic male)"
+                        "Speaker voice ID. Options: "
+                        "zh_female_vv_uranus_bigtts (vivi, sweet female, DEFAULT), "
+                        "zh_male_dayi_saturn_bigtts (大壹, warm male), "
+                        "zh_male_ruyayichen_saturn_bigtts (儒雅逸辰, elegant male), "
+                        "zh_female_meilinvyou_saturn_bigtts (魅力女友, charming female), "
+                        "zh_female_santongyongns_saturn_bigtts (流畅女声, fluent female), "
+                        "saturn_zh_female_cancan_tob (知性灿灿, intellectual female), "
+                        "saturn_zh_female_keainvsheng_tob (可爱女生, cute girl), "
+                        "saturn_zh_female_tiaopigongzhu_tob (调皮公主, playful princess)"
                     ),
+                },
+                "emotion": {
+                    "type": "string",
+                    "description": (
+                        "Emotion/style for the voice. Options: "
+                        "happy, pleased, sad, angry, annoyed, sorry, scare, surprise, tear, "
+                        "narrator, comfort, chat, energetic, charming, "
+                        "lovey-dovey, conniving, tsundere, storytelling, radio, serious"
+                    ),
+                },
+                "emotion_scale": {
+                    "type": "integer",
+                    "description": "Emotion intensity 1-10 (default 4, higher = stronger emotion)",
                 },
             },
             "required": ["content"],
@@ -76,6 +97,8 @@ class VoiceReplyTool(Tool):
         self,
         content: str,
         voice: str | None = None,
+        emotion: str | None = None,
+        emotion_scale: int | None = None,
         **kwargs: Any,
     ) -> str:
         channel = self._default_channel
@@ -88,13 +111,15 @@ class VoiceReplyTool(Tool):
             return "Error: Message sending not configured"
 
         if not self._tts:
-            return "Error: TTS provider not configured. Set providers.dashscope.apiKey in config."
+            return "Error: TTS provider not configured. Set tools.tts in config."
 
         try:
             # Synthesize speech
-            audio_path = await self._tts.synthesize(content, voice=voice)
+            audio_path = await self._tts.synthesize(
+                content, voice=voice, emotion=emotion, emotion_scale=emotion_scale,
+            )
             if not audio_path:
-                return "Error: TTS synthesis failed — check DashScope API key and logs"
+                return "Error: TTS synthesis failed — check TTS provider config and logs"
 
             # Send voice message with text as caption
             msg = OutboundMessage(

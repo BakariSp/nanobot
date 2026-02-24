@@ -8,16 +8,28 @@ from nanobot.agent.tools.base import Tool
 class ToolRegistry:
     """
     Registry for agent tools.
-    
+
     Allows dynamic registration and execution of tools.
     """
-    
+
     def __init__(self):
         self._tools: dict[str, Tool] = {}
-    
-    def register(self, tool: Tool) -> None:
-        """Register a tool."""
+        self._modes: dict[str, str] = {}  # tool_name → required mode (e.g. "kevin")
+        self._exclude_modes: dict[str, set[str]] = {}  # tool_name → modes where tool is hidden
+
+    def register(self, tool: Tool, mode: str | None = None, exclude_modes: list[str] | None = None) -> None:
+        """Register a tool, optionally restricted to or excluded from session modes.
+
+        Args:
+            tool: The tool to register.
+            mode: If set, tool is ONLY visible in this mode (e.g. "kevin").
+            exclude_modes: If set, tool is hidden in these modes (e.g. ["kevin"]).
+        """
         self._tools[tool.name] = tool
+        if mode:
+            self._modes[tool.name] = mode
+        if exclude_modes:
+            self._exclude_modes[tool.name] = set(exclude_modes)
     
     def unregister(self, name: str) -> None:
         """Unregister a tool by name."""
@@ -31,9 +43,21 @@ class ToolRegistry:
         """Check if a tool is registered."""
         return name in self._tools
     
-    def get_definitions(self) -> list[dict[str, Any]]:
-        """Get all tool definitions in OpenAI format."""
-        return [tool.to_schema() for tool in self._tools.values()]
+    def get_definitions(self, mode: str | None = None) -> list[dict[str, Any]]:
+        """Get tool definitions in OpenAI format, filtered by session mode.
+
+        Args:
+            mode: Current session mode (e.g. "kevin").  When set, mode-restricted
+                  tools for *that* mode are included.  Tools restricted to a
+                  *different* mode are excluded.  When None, only unrestricted
+                  tools are returned.
+        """
+        return [
+            tool.to_schema()
+            for name, tool in self._tools.items()
+            if (name not in self._modes or self._modes[name] == mode)
+            and not (mode and name in self._exclude_modes and mode in self._exclude_modes[name])
+        ]
     
     async def execute(self, name: str, params: dict[str, Any]) -> str:
         """
