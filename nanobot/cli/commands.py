@@ -307,6 +307,7 @@ def gateway(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ):
     """Start the nanobot gateway."""
+    from loguru import logger
     from nanobot.config.loader import load_config, get_data_dir
     from nanobot.bus.queue import MessageBus
     from nanobot.agent.loop import AgentLoop
@@ -347,6 +348,8 @@ def gateway(
         max_iterations=config.agents.defaults.max_tool_iterations,
         memory_window=config.agents.defaults.memory_window,
         brave_api_key=config.tools.web.search.api_key or None,
+        google_cse_api_key=config.tools.web.search.google_cse_api_key or None,
+        google_cse_cx=config.tools.web.search.google_cse_cx or None,
         exec_config=config.tools.exec,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
@@ -358,14 +361,21 @@ def gateway(
         image_gen_config=config.tools.image_gen,
         tts_config=config.tools.tts,
         dashscope_api_key=(config.providers.dashscope.api_key or ""),
+        kevin_config=config.kevin,
     )
 
     # Set cron callback (needs agent)
     async def on_cron_job(job: CronJob) -> str | None:
         """Execute a cron job through the agent."""
+        # Kevin's cron jobs should use his persistent session (mode="kevin")
+        # so he gets his Kevin system prompt, not the default Zero prompt.
+        if job.payload.to == "kevin":
+            session_key = "cron:kevin"
+        else:
+            session_key = f"cron:{job.id}"
         response = await agent.process_direct(
             job.payload.message,
-            session_key=f"cron:{job.id}",
+            session_key=session_key,
             channel=job.payload.channel or "cli",
             chat_id=job.payload.to or "direct",
         )
@@ -408,6 +418,47 @@ def gateway(
     
     from nanobot.ralph_loop import ralph_loop as _ralph_loop
 
+    async def _supervised_ralph():
+        """Run Ralph Loop with automatic restart on crash.
+
+        Isolates Ralph crashes from the main gateway — agent + channels
+        keep running even if Ralph fails. Restarts after 10s cooldown,
+        gives up after 5 consecutive crashes.
+        """
+        max_consecutive = 5
+        consecutive = 0
+        while True:
+            try:
+                await _ralph_loop()
+                break  # clean exit
+            except asyncio.CancelledError:
+                break  # gateway shutdown
+            except Exception as e:
+                consecutive += 1
+                logger.error(f"Ralph Loop crashed ({consecutive}/{max_consecutive}): {e}")
+                if consecutive >= max_consecutive:
+                    logger.error("Ralph Loop exceeded max consecutive crashes, stopping.")
+                    # Best-effort notify Zero
+                    try:
+                        from nanobot.agent.tools.task_ledger import DualLedger
+                        DualLedger().append_notification(
+                            task_id="SYSTEM", run_id="SYSTEM", status="error",
+                            summary=f"Ralph Loop stopped after {max_consecutive} consecutive crashes: {e}",
+                        )
+                    except Exception:
+                        pass
+                    break
+                # Notify Zero about crash & restart
+                try:
+                    from nanobot.agent.tools.task_ledger import DualLedger
+                    DualLedger().append_notification(
+                        task_id="SYSTEM", run_id="SYSTEM", status="error",
+                        summary=f"Ralph Loop crashed and will restart in 10s: {e}",
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(10)
+
     async def run():
         try:
             await cron.start()
@@ -415,7 +466,7 @@ def gateway(
             await asyncio.gather(
                 agent.run(),
                 channels.start_all(),
-                _ralph_loop(),
+                _supervised_ralph(),
             )
         except KeyboardInterrupt:
             console.print("\nShutting down...")
@@ -423,7 +474,7 @@ def gateway(
             cron.stop()
             agent.stop()
             await channels.stop_all()
-    
+
     asyncio.run(run())
 
 
@@ -472,6 +523,8 @@ def agent(
         max_iterations=config.agents.defaults.max_tool_iterations,
         memory_window=config.agents.defaults.memory_window,
         brave_api_key=config.tools.web.search.api_key or None,
+        google_cse_api_key=config.tools.web.search.google_cse_api_key or None,
+        google_cse_cx=config.tools.web.search.google_cse_cx or None,
         exec_config=config.tools.exec,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         task_ledger=task_ledger,
@@ -481,6 +534,7 @@ def agent(
         image_gen_config=config.tools.image_gen,
         tts_config=config.tools.tts,
         dashscope_api_key=(config.providers.dashscope.api_key or ""),
+        kevin_config=config.kevin,
     )
 
     # Show spinner when logs are off (no output to miss); skip when logs are on

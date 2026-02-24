@@ -31,7 +31,11 @@ class Session:
     last_consolidated: int = 0  # Number of messages already consolidated to files
     
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
-        """Add a message to the session."""
+        """Add a message to the session.
+
+        Pass ``media=["https://..."]`` to persist image URLs alongside the
+        message so they can be re-injected when replaying history.
+        """
         msg = {
             "role": role,
             "content": content,
@@ -40,14 +44,25 @@ class Session:
         }
         self.messages.append(msg)
         self.updated_at = datetime.now()
-    
+
     def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
-        """Get recent messages in LLM format with timestamps."""
+        """Get recent messages in LLM format with timestamps.
+
+        Messages that have a ``media`` field will include it in the returned
+        dict so the context builder can re-inject images into the LLM prompt.
+        """
         result = []
         for m in self.messages[-max_messages:]:
             ts = m.get("timestamp", "")[:16]  # "2026-02-17T00:14" → keep date+HH:MM
             prefix = f"[{ts}] " if ts else ""
-            result.append({"role": m["role"], "content": f"{prefix}{m['content']}"})
+            # Tag user messages with "Cai:" so the model internalises the name
+            # instead of defaulting to "用户" in its reasoning chain.
+            if m["role"] == "user":
+                prefix += "Cai: "
+            entry: dict[str, Any] = {"role": m["role"], "content": f"{prefix}{m['content']}"}
+            if m.get("media"):
+                entry["media"] = m["media"]
+            result.append(entry)
         return result
     
     def clear(self) -> None:

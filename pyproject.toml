@@ -41,6 +41,8 @@ dependencies = [
     "notion-client>=2.0.0",
     "telethon>=1.36.0",
     "mcp>=1.0.0",
+    "dashscope>=1.20.0",
+    "oss2>=2.18.0",
 ]
 
 [project.optional-dependencies]
@@ -48,6 +50,9 @@ dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
     "ruff>=0.1.0",
+]
+kevin = [
+    "pybit>=5.8.0",
 ]
 
 [project.scripts]
