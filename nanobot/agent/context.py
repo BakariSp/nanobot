@@ -67,11 +67,16 @@ The following skills extend your capabilities. To use a skill, read its SKILL.md
 Skills with available="false" need dependencies installed first - you can try installing them with apt/brew.
 
 {skills_summary}""")
-        
+
+        # Boot recovery context (plugin changelog + crash correlation)
+        recovery = self._build_recovery_context()
+        if recovery:
+            parts.append(f"# Boot Recovery\n\n{recovery}")
+
         return "\n\n---\n\n".join(parts)
     
     def _get_identity(self) -> str:
-        """Get the core identity section."""
+        """Runtime context only — personality & instructions come from SOUL.md / AGENTS.md."""
         from datetime import datetime
         import time as _time
         now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
@@ -79,35 +84,17 @@ Skills with available="false" need dependencies installed first - you can try in
         workspace_path = str(self.workspace.expanduser().resolve())
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
-        
-        return f"""# nanobot 🐈
 
-You are nanobot, a helpful AI assistant. You have access to tools that allow you to:
-- Read, write, and edit files
-- Execute shell commands
-- Search the web and fetch web pages
-- Send messages to users on chat channels
-- Spawn subagents for complex background tasks
+        return f"""# Runtime
 
 ## Current Time
 {now} ({tz})
 
-## Runtime
+## Environment
 {runtime}
 
 ## Workspace
-Your workspace is at: {workspace_path}
-- Long-term memory: {workspace_path}/memory/MEMORY.md
-- History log: {workspace_path}/memory/HISTORY.md (grep-searchable)
-- Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
-
-IMPORTANT: When responding to direct questions or conversations, reply directly with your text response.
-Only use the 'message' tool when you need to send a message to a specific chat channel (like WhatsApp).
-For normal conversation, just respond with text - do not call the message tool.
-
-Always be helpful, accurate, and concise. When using tools, think step by step: what you know, what you need, and why you chose this tool.
-When remembering something important, write to {workspace_path}/memory/MEMORY.md
-To recall past events, grep {workspace_path}/memory/HISTORY.md"""
+{workspace_path}"""
     
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""
@@ -120,7 +107,47 @@ To recall past events, grep {workspace_path}/memory/HISTORY.md"""
                 parts.append(f"## {filename}\n\n{content}")
         
         return "\n\n".join(parts) if parts else ""
-    
+
+    def _build_recovery_context(self) -> str:
+        """Build boot recovery context from plugin changelog and doctor state.
+
+        Injected into the system prompt so the agent knows what happened
+        before the last restart (especially crash-related plugin rollbacks).
+        """
+        lines: list[str] = []
+
+        try:
+            from nanobot.agent.tools.plugin_edit import read_changelog
+            entries = read_changelog(limit=5)
+            if entries:
+                lines.append("## Recent plugin edits")
+                for e in entries:
+                    ts = e.get("ts", "?")[:19]
+                    fname = Path(e.get("file", "?")).name
+                    reason = e.get("reason", "")
+                    status = e.get("status", "?")
+                    err = e.get("validation_error", "")
+                    line = f"- [{ts}] {fname}: {reason} ({status})"
+                    if err:
+                        line += f" — {err}"
+                    lines.append(line)
+        except Exception:
+            pass
+
+        try:
+            from nanobot.doctor.state import load_state
+            state = load_state()
+            crash_ts = state.get("last_crash_ts")
+            if crash_ts:
+                lines.append(f"\n## Last crash: {crash_ts[:19]}")
+                total = state.get("total_crashes", 0)
+                if total:
+                    lines.append(f"Total crashes recorded: {total}")
+        except Exception:
+            pass
+
+        return "\n".join(lines) if lines else ""
+
     def build_messages(
         self,
         history: list[dict[str, Any]],
@@ -154,8 +181,13 @@ To recall past events, grep {workspace_path}/memory/HISTORY.md"""
             system_prompt += f"\n\n## Current Session\nChannel: {channel}\nChat ID: {chat_id}"
         messages.append({"role": "system", "content": system_prompt})
 
-        # History
-        messages.extend(history)
+        # History — re-inject media (OSS URLs) into multimodal format
+        for h in history:
+            if h.get("media") and h["role"] == "user":
+                content = self._build_user_content(h["content"], h["media"])
+                messages.append({"role": "user", "content": content})
+            else:
+                messages.append({"role": h["role"], "content": h["content"]})
 
         # Current message (with optional image attachments)
         user_content = self._build_user_content(current_message, media)
@@ -164,19 +196,29 @@ To recall past events, grep {workspace_path}/memory/HISTORY.md"""
         return messages
 
     def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
-        """Build user message content with optional base64-encoded images."""
+        """Build user message content with optional images.
+
+        Supports two media reference formats:
+        - URL (``https://...``) → passed directly as ``image_url``
+        - Local path → base64-encoded as data URL (fallback)
+        """
         if not media:
             return text
-        
+
         images = []
-        for path in media:
-            p = Path(path)
-            mime, _ = mimetypes.guess_type(path)
-            if not p.is_file() or not mime or not mime.startswith("image/"):
-                continue
-            b64 = base64.b64encode(p.read_bytes()).decode()
-            images.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
-        
+        for ref in media:
+            if ref.startswith("https://") or ref.startswith("http://"):
+                # OSS or other public URL — pass directly
+                images.append({"type": "image_url", "image_url": {"url": ref}})
+            else:
+                # Local file — base64 encode
+                p = Path(ref)
+                mime, _ = mimetypes.guess_type(ref)
+                if not p.is_file() or not mime or not mime.startswith("image/"):
+                    continue
+                b64 = base64.b64encode(p.read_bytes()).decode()
+                images.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+
         if not images:
             return text
         return images + [{"type": "text", "text": text}]

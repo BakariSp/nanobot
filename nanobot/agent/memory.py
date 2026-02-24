@@ -15,6 +15,7 @@ class MemoryStore:
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "HISTORY.md"
         self.tasks_dir = ensure_dir(self.memory_dir / "tasks")
+        self.projects_dir = ensure_dir(self.memory_dir / "projects")
 
     def read_long_term(self) -> str:
         if self.memory_file.exists():
@@ -34,18 +35,26 @@ class MemoryStore:
 
     def get_active_task_path(self) -> Path | None:
         """Return the Path to the active task file, or None."""
-        rel = self._parse_active_task_file(self.read_long_term())
+        rel = self._parse_active_field(self.read_long_term(), "Active Task", "file")
         if not rel:
             return None
         p = self.workspace / rel
         return p if p.exists() else None
 
-    def _parse_active_task_file(self, content: str) -> str | None:
-        """Extract the 'file:' value from the Active Task section."""
-        section = self._extract_section(content, "Active Task")
+    def get_active_project_path(self) -> Path | None:
+        """Return the Path to the active project file, or None."""
+        rel = self._parse_active_field(self.read_long_term(), "Active Project", "project")
+        if not rel:
+            return None
+        p = self.workspace / rel
+        return p if p.exists() else None
+
+    def _parse_active_field(self, content: str, heading: str, field: str) -> str | None:
+        """Extract a '- field: value' from a ## heading section."""
+        section = self._extract_section(content, heading)
         if not section:
             return None
-        m = re.search(r"^- file:\s*(.+)$", section, re.MULTILINE)
+        m = re.search(rf"^- {re.escape(field)}:\s*(.+)$", section, re.MULTILINE)
         return m.group(1).strip() if m else None
 
     @staticmethod
